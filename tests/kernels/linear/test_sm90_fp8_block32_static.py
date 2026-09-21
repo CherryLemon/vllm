@@ -556,3 +556,74 @@ def test_init_selects_marlin_by_default(monkeypatch):
     if not MarlinMxfp8LinearKernel.is_supported()[0]:
         pytest.skip("Marlin is unavailable on this box")
     assert type(init_mxfp8_linear_kernel()) is MarlinMxfp8LinearKernel
+
+def _triton_variant_count(jit_fn) -> int:
+    """Number of compiled Triton variants cached for a @triton.jit function."""
+    caches = getattr(jit_fn, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton build does not expose device_caches")
+    return sum(len(entry[0]) for entry in caches.values())
+
+
+@requires_sm90
+def test_no_per_m_compilation_including_splitk_reduction():
+    """Distinct token counts must not trigger new compilations.
+
+    ``M`` is a runtime argument on the GEMM and the SplitK reduction because
+    vLLM feeds this kernel an open-ended set of token counts (every eager
+    prefill tail, every mixed-batch size).  A constexpr ``M`` compiled a fresh
+    binary per shape, and the first request of each new bucket paid a JIT spike
+    that CUDA-graph capture cannot absorb.
+
+    The reduction is checked separately and with a ``SPLIT_K > 1`` config: its
+    ``ELEMENTS == M * N`` was a constexpr too, so fixing only the main GEMM
+    still left the ``SPLIT_K > 1`` entries (including the tuned 1280x5120 one)
+    recompiling per M.  Testing a ``SPLIT_K == 1`` config would miss it.
+
+    Asserting on the *compiled-variant count* rather than wall time keeps this
+    independent of machine noise.
+    """
+    from vllm.model_executor.kernels.linear.mxfp8.sm90_static import (
+        _reduce_block_fp8_split_k,
+        _w8a8_block_fp8_matmul_hopper_static,
+    )
+
+    N, K = 1280, 5120  # the tuned entry that uses SPLIT_K == 8
+    cfg = select_sm90_static_config(N, K, 64)
+    assert int(cfg["SPLIT_K"]) > 1, cfg
+
+    # Crosses BLOCK_SIZE_M and no-masking/tail boundaries on purpose.
+    Ms = [1, 7, 33, 64, 65, 100, 129, 256, 333, 512]
+
+    def run(m: int) -> None:
+        a = _rand_fp8((m, K))
+        b = _rand_fp8((N, K))
+        out = sm90_static_gemm(
+            a,
+            b,
+            _rand_act_scale((m, K // _MXFP8_BLOCK)),
+            _rand_weight_scale_uint8((N, K // _MXFP8_BLOCK)),
+            cfg,
+            out_dtype=torch.bfloat16,
+        )
+        assert out.shape == (m, N)
+
+    run(Ms[0])
+    torch.cuda.synchronize()
+    main0 = _triton_variant_count(_w8a8_block_fp8_matmul_hopper_static)
+    red0 = _triton_variant_count(_reduce_block_fp8_split_k)
+
+    for m in Ms[1:]:
+        run(m)
+        torch.cuda.synchronize()
+
+    main1 = _triton_variant_count(_w8a8_block_fp8_matmul_hopper_static)
+    red1 = _triton_variant_count(_reduce_block_fp8_split_k)
+    assert main1 == main0, (
+        f"the main GEMM compiled {main1 - main0} extra variant(s) across "
+        f"{len(Ms)} distinct M values; M must stay a runtime argument"
+    )
+    assert red1 == red0, (
+        f"the SplitK reduction compiled {red1 - red0} extra variant(s) across "
+        f"{len(Ms)} distinct M values; ELEMENTS must stay a runtime argument"
+    )

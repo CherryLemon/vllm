@@ -198,6 +198,12 @@ def test_sm90_fp4_forces_flattening_for_spec_decode(monkeypatch, next_n):
     ``next_n == 1``.
     """
     monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
+    # The subject here is the flattening contract, not which platform/kv-dtype
+    # combination is legal (``test_dsa_indexer_uses_fp4_gating`` covers that).
+    # The real ``dsa_indexer_uses_fp4`` inspects the platform and would raise on
+    # a CPU-only box, so pin it; otherwise this test only passes where a real
+    # family(90) device happens to be present.
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: True)
     # The DeepGEMM table SM90 would otherwise consult: 2 and 4 are "native".
     monkeypatch.setattr(
         indexer_mod, "_supports_native_decode", lambda n: n in (1, 2, 4)
@@ -230,6 +236,7 @@ def test_sm90_fp4_capability_is_fp4_only(monkeypatch):
 def test_dspark_block5_next_n_matches_block_size(monkeypatch):
     """DSpark block5 verifies 1 + dspark_block_size rows and always flattens."""
     monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: True)
     monkeypatch.setattr(
         indexer_mod, "_supports_native_decode", lambda n: n in (1, 2, 4)
     )
@@ -238,3 +245,50 @@ def test_dspark_block5_next_n_matches_block_size(monkeypatch):
     next_n = 1 + cfg.num_speculative_tokens
     assert next_n == 6
     assert indexer_mod._use_flattening(cfg) is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_reserve_workspaces_claims_overlap_in_lifetime(monkeypatch):
+    """The logits and top-k scratch reservations must be live together.
+
+    vLLM's memory profiling reads ``allocated_bytes.all.peak``, so two
+    anonymous sequential ``torch.empty`` calls only ever register the larger
+    one.  The real step holds the fp32 compact logits *and* the prefill top-k
+    scratch at the same time, so the reservation has to as well -- otherwise
+    the transient-headroom estimate is short by the smaller claim.
+    """
+    import torch.nn as nn
+
+    import vllm.model_executor.layers.sparse_mqa_indexer as mod
+
+    # Stub the K-gather workspace: it goes through vLLM's workspace manager and
+    # is not what this test is about.
+    monkeypatch.setattr(mod, "_prefill_k_workspaces", lambda *a, **k: (None, None))
+
+    obj = object.__new__(mod.SparseMQAIndexer)
+    nn.Module.__init__(obj)
+    obj.max_total_seq_len = 1024
+    obj.head_dim = 128
+    obj.use_sm90 = True
+    obj.candidate_blocks = torch.zeros((1, 16), dtype=torch.int32)
+    obj.candidate_block_size = 8
+
+    device = torch.device("cuda")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+
+    obj._reserve_workspaces(device)
+
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+
+    logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    scratch_bytes = (
+        mod._PREFILL_TOPK_ROW_CHUNK * 16 * 8 * mod._PREFILL_TOPK_BYTES_PER_ELEM
+    )
+    assert peak >= logits_bytes + scratch_bytes, (
+        f"peak {peak} < logits {logits_bytes} + scratch {scratch_bytes}: the two "
+        "reservations do not overlap in lifetime"
+    )

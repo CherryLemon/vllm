@@ -50,6 +50,26 @@ from vllm.v1.worker.workspace import current_workspace_manager
 # index / fp32 mask scratch to `chunk * width` instead of `rows * width`.
 _PREFILL_TOPK_ROW_CHUNK = 64
 
+# Measured transient peak of ``_prefill_candidate_topk`` per element of the
+# chunked ``[_PREFILL_TOPK_ROW_CHUNK, compact_width]`` working set, on H100 with
+# `compact_width = 16384` (DeepSeek-V4.1-Flash: 2048 candidate blocks x 8):
+#
+#   rows   chunks   steady-state peak
+#     64        1   22.38 MiB   (22.4 B/element)
+#     65        2   22.38 MiB
+#    128        2   33.88 MiB   (33.9 B/element)
+#    512        8   33.88 MiB
+#   4096       64   33.88 MiB   <- bounded, does not grow with row count
+#
+# The 1.51x step from one to two chunks is the overlap between consecutive loop
+# iterations (the previous chunk's temporaries are still referenced while the
+# next one allocates); it is flat thereafter.  The analytic `8 + 4 + 4` used
+# earlier only counted three tensors and missed `valid`, the int64 conversion
+# temporaries and the top-k values/indices -- and, being a *single-chunk*
+# figure, it also missed the cross-chunk overlap.  40 B/element is that
+# measured 33.9 rounded up.
+_PREFILL_TOPK_BYTES_PER_ELEM = 40
+
 
 def _prefill_k_workspaces(
     total_seq_lens: int, head_dim: int
@@ -165,20 +185,36 @@ class SparseMQAIndexer(nn.Module):
         The SM90 compact path is fp32 (not bf16) and its prefill top-k keeps an
         int64 index matrix and an fp32 mask next to the logits, so reserve that
         peak as well instead of budgeting from the logits tensor alone.
+
+        Every claim is held in ``claims`` until the end.  vLLM's memory
+        profiling reads ``allocated_bytes.all.peak``, so two anonymous
+        sequential ``torch.empty`` calls would only ever register the larger
+        one; the real step holds the fp32 logits and the top-k scratch
+        simultaneously, so the reservation must too.
         """
         _prefill_k_workspaces(self.max_total_seq_len, self.head_dim)
+
+        claims: list[torch.Tensor] = []
         max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        torch.empty(max_logits_bytes, dtype=torch.uint8, device=device)
+        claims.append(
+            torch.empty(max_logits_bytes, dtype=torch.uint8, device=device)
+        )
         if self.use_sm90:
-            # int64 ``logical`` + int32 candidate gather + fp32 ``masked``,
-            # bounded to one chunk of rows by ``_PREFILL_TOPK_ROW_CHUNK``.
-            compact_width = self.candidate_blocks.shape[1] * self.candidate_block_size
-            per_row_bytes = compact_width * (8 + 4 + 4)
-            torch.empty(
-                _PREFILL_TOPK_ROW_CHUNK * per_row_bytes,
-                dtype=torch.uint8,
-                device=device,
+            compact_width = (
+                self.candidate_blocks.shape[1] * self.candidate_block_size
             )
+            scratch_bytes = (
+                _PREFILL_TOPK_ROW_CHUNK
+                * compact_width
+                * _PREFILL_TOPK_BYTES_PER_ELEM
+            )
+            claims.append(
+                torch.empty(scratch_bytes, dtype=torch.uint8, device=device)
+            )
+        # Keep the claims alive across the whole call: dropping them earlier
+        # would shrink the measured peak back to the largest single one.
+        assert len(claims) >= 1
+        del claims
 
     def _forward_sm90(
         self,

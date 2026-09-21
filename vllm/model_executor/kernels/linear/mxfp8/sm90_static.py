@@ -883,10 +883,18 @@ def _w8a8_block_fp8_matmul_hopper_static(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ELEMENTS"])
 def _reduce_block_fp8_split_k(
-    Parts, Out, ELEMENTS: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+    Parts, Out, ELEMENTS, SPLITS: tl.constexpr, BLOCK: tl.constexpr
 ):
+    """Sum the ``SPLITS`` fp32 partials of the SplitK GEMM into ``Out``.
+
+    ``ELEMENTS == M * N`` is a *runtime* argument: leaving it as a constexpr
+    made every new M compile another reduction binary, defeating the
+    ``do_not_specialize`` on the main GEMM for any config with ``SPLIT_K > 1``
+    (which includes several tuned ``(N, K)`` entries).  Only the split count
+    and the block size stay compile-time here.
+    """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     splits = tl.arange(0, SPLITS)
     values = tl.load(
