@@ -31,7 +31,10 @@ from dsv41_long_context_bench import make_prompt, run_burst  # noqa: E402
 
 
 async def post(session: aiohttp.ClientSession, url: str) -> tuple[int, str]:
-    async with session.post(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+    # Stopping flushes one trace per rank, which takes minutes on a loaded
+    # instance (8 ranks x several hundred MB); a short timeout makes a
+    # successful stop look like a failure.
+    async with session.post(url, timeout=aiohttp.ClientTimeout(total=900)) as r:
         return r.status, (await r.text())[:200]
 
 
