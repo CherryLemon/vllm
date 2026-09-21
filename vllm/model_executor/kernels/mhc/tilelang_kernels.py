@@ -817,6 +817,64 @@ def mhc_post_tilelang(
             T.pdl_trigger()
 
 
+# mHC post-mix with independent token/hidden CTAs. Identical expression and
+# serial residual-channel accumulation order as ``mhc_post_tilelang``; the only
+# difference is that the hidden axis is split across CTAs, which makes the SM90
+# (H100) path usable for up to 240 tokens. Ported from SGLang
+# ``kernels/ops/layernorm/mhc_post_split_h_tilelang.py``.
+@tilelang_jit
+def mhc_post_split_h_tilelang(
+    a,
+    b,
+    c,
+    d,
+    x,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+) -> tilelang.JITKernel:
+    # rename for shorter code
+    n = T.dynamic("num_tokens")
+
+    h_blk = math.gcd(hidden, h_blk)
+    a: T.Tensor((n, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    b: T.Tensor((n, hc, hidden), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    c: T.Tensor((n, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    d: T.Tensor((n, hidden), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    x: T.Tensor((n, hc, hidden), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    with T.Kernel(n, T.ceildiv(hidden, h_blk), threads=n_thr) as (i_n, i_t):
+        if ENABLE_PDL:
+            T.pdl_sync()
+        b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+        d_shared = T.alloc_shared(h_blk, T.bfloat16)
+        x_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+
+        x_local = T.alloc_fragment((hc, h_blk), T.float32)
+        b_local = T.alloc_fragment((hc, h_blk), T.float32)
+        d_local = T.alloc_fragment(h_blk, T.float32)
+
+        a_local = T.alloc_fragment((hc, hc), T.float32)
+        c_local = T.alloc_fragment(hc, T.float32)
+        T.copy(a[i_n, 0, 0], a_local)
+        T.copy(c[i_n, 0], c_local)
+
+        T.copy(b[i_n, 0, i_t * h_blk], b_shared)
+        T.copy(d[i_n, i_t * h_blk], d_shared)
+        T.copy(b_shared, b_local)
+        T.copy(d_shared, d_local)
+        for i_hco, i1_h in T.Parallel(hc, h_blk):
+            x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+            # Serial, unlike ``mhc_post_tilelang``'s vectorized loop, to match
+            # the SGLang reference accumulation order exactly.
+            for i_hci in T.serial(hc):
+                x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+        T.copy(x_local, x_shared)
+        T.copy(x_shared, x[i_n, 0, i_t * h_blk])
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
 @tilelang_jit
 def hc_prenorm_gemm_tilelang(
     x,
@@ -1635,6 +1693,125 @@ class MhcPostTileLangKernel(VllmTileLangJitKernel["MhcPostTileLangKernel.Compile
             hidden_size,
         )
 
+    def register_warmup(self, *args: Any, **kwargs: Any) -> None:
+        """Register the post kernel and, on SM90, its split-H variant.
+
+        The model-side warmup only enumerates ``MhcPostTileLangKernel`` keys.
+        Hooking here keeps the opt-in split-H kernel warm without touching the
+        (separately owned) model files; it is a no-op unless the SM90 split-H
+        path is enabled.
+        """
+        super().register_warmup(*args, **kwargs)
+        if kwargs.get("hidden_size") != 5120 or kwargs.get("hc_mult") != 4:
+            return
+        from vllm.model_executor.kernels.mhc.tilelang import (
+            has_sm90_mhc_split_h,
+        )
+
+        if not has_sm90_mhc_split_h():
+            return
+        _MHC_POST_SPLIT_H_TILELANG_KERNEL.register_warmup(
+            hidden_size=kwargs["hidden_size"],
+            hc_mult=kwargs["hc_mult"],
+        )
+
+
+# Tuning for the split-H post kernel, matching the SGLang port.
+MHC_SPLIT_H_BLOCK = 1024
+MHC_SPLIT_H_THREADS = 128
+
+
+class MhcPostSplitHTileLangKernel(
+    VllmTileLangJitKernel["MhcPostSplitHTileLangKernel.CompileKey"]
+):
+    @dataclass(frozen=True)
+    class CompileKey:
+        hidden_size: int
+        hc_mult: int
+        h_blk: int
+
+    @staticmethod
+    def kernel() -> Any:
+        return mhc_post_split_h_tilelang
+
+    def dispatch(  # type: ignore[override]
+        self,
+        *,
+        hidden_size: int,
+        hc_mult: int,
+    ) -> CompileKey:
+        # Subscripts rather than an unpack: the warmup tracer parses this body
+        # and allows only plain assignments before the return.
+        h_blk = math.gcd(hidden_size, MHC_SPLIT_H_BLOCK)
+        return self.CompileKey(
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            h_blk=h_blk,
+        )
+
+    def get_warmup_keys(
+        self,
+        *,
+        hidden_size: int,
+        hc_mult: int,
+    ) -> list[CompileKey]:
+        return self._trace_dispatch(self.dispatch)(
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+        )
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        num_tokens = 1
+        hidden_size = compile_key.hidden_size
+        hc_mult = compile_key.hc_mult
+        comb_mix = make_tilelang_warmup_tensor(
+            torch.float32, num_tokens, hc_mult, hc_mult
+        )
+        residual = make_tilelang_warmup_tensor(
+            torch.bfloat16, num_tokens, hc_mult, hidden_size
+        )
+        post_mix = make_tilelang_warmup_tensor(torch.float32, num_tokens, hc_mult)
+        layer_input = make_tilelang_warmup_tensor(
+            torch.bfloat16, num_tokens, hidden_size
+        )
+        out = make_tilelang_warmup_tensor(
+            torch.bfloat16, num_tokens, hc_mult, hidden_size
+        )
+        return dict(
+            comb_mix=comb_mix,
+            residual=residual,
+            post_mix=post_mix,
+            layer_input=layer_input,
+            out=out,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            h_blk=compile_key.h_blk,
+        )
+
+    @kernel_launcher
+    def __call__(
+        self,
+        comb_mix: Any,
+        residual: Any,
+        post_mix: Any,
+        layer_input: Any,
+        out: Any,
+        hc_mult: int,
+        hidden_size: int,
+        h_blk: int = MHC_SPLIT_H_BLOCK,
+    ) -> TileLangLaunchSpec:
+        return (), (
+            comb_mix,
+            residual,
+            post_mix,
+            layer_input,
+            out,
+            hc_mult,
+            hidden_size,
+            MHC_SPLIT_H_THREADS,
+            h_blk,
+        )
+
 
 class MhcFusedTileLangKernel(
     VllmTileLangJitKernel["MhcFusedTileLangKernel.CompileKey"]
@@ -1848,5 +2025,6 @@ class HcHeadFusedTileLangKernel(
 _HC_PRENORM_GEMM_TILELANG_KERNEL = HcPrenormGemmTileLangKernel()
 _MHC_PRE_BIG_FUSE_TILELANG_KERNEL = MhcPreBigFuseTileLangKernel()
 _MHC_POST_TILELANG_KERNEL = MhcPostTileLangKernel()
+_MHC_POST_SPLIT_H_TILELANG_KERNEL = MhcPostSplitHTileLangKernel()
 _MHC_FUSED_TILELANG_KERNEL = MhcFusedTileLangKernel()
 _HC_HEAD_FUSED_TILELANG_KERNEL = HcHeadFusedTileLangKernel()

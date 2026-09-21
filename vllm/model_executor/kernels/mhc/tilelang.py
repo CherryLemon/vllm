@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -788,6 +791,61 @@ def mhc_pre_broadcast_tilelang(
     )
 
 
+def has_sm90_mhc_split_h() -> bool:
+    """Whether the SM90 split-H TileLang post kernel may be used.
+
+    Opt-in through ``VLLM_SM90_MHC_SPLIT_H`` and limited to SM90 (H100/H200)
+    CUDA. The flag normally lives in :mod:`vllm.envs`; the raw environment is
+    consulted as a fallback so this predicate also works before the env entry
+    is registered.
+    """
+    from vllm import envs
+
+    value = getattr(envs, "VLLM_SM90_MHC_SPLIT_H", None)
+    if value is None:
+        raw = os.environ.get("VLLM_SM90_MHC_SPLIT_H")
+        enabled = raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        enabled = bool(value)
+    return (
+        enabled
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(90)
+    )
+
+
+def _mhc_post_split_h_supported(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> bool:
+    """Shape/dtype/contiguity gate for the split-H post kernel.
+
+    Mirrors the SGLang guard (``deepseek_v4.py`` v12) for the subset vLLM
+    supports: hidden 5120, hc_mult 4, 1 <= tokens <= 240. Device/platform is
+    checked separately by :func:`has_sm90_mhc_split_h`.
+    """
+    if x.dim() != 2:
+        return False
+    num_tokens = x.shape[0]
+    return (
+        has_sm90_mhc_split_h()
+        and 1 <= num_tokens <= 240
+        and x.shape[1] == 5120
+        and residual.shape == (num_tokens, 4, 5120)
+        and x.dtype == residual.dtype == torch.bfloat16
+        and post_layer_mix.dtype == comb_res_mix.dtype == torch.float32
+        and post_layer_mix.shape in ((num_tokens, 4), (num_tokens, 4, 1))
+        and post_layer_mix.numel() == num_tokens * 4
+        and comb_res_mix.shape == (num_tokens, 4, 4)
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and post_layer_mix.is_contiguous()
+        and comb_res_mix.is_contiguous()
+    )
+
+
 def mhc_post_tilelang(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -797,6 +855,25 @@ def mhc_post_tilelang(
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         _MHC_POST_TILELANG_KERNEL,
     )
+
+    if _mhc_post_split_h_supported(x, residual, post_layer_mix, comb_res_mix):
+        from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+            _MHC_POST_SPLIT_H_TILELANG_KERNEL,
+            MHC_SPLIT_H_BLOCK,
+        )
+
+        out = torch.empty_like(residual)
+        _MHC_POST_SPLIT_H_TILELANG_KERNEL(
+            comb_res_mix,
+            residual,
+            post_layer_mix.reshape(x.shape[0], 4),
+            x,
+            out,
+            residual.shape[-2],
+            residual.shape[-1],
+            MHC_SPLIT_H_BLOCK,
+        )
+        return out
 
     out = torch.empty_like(residual)
     _MHC_POST_TILELANG_KERNEL(
