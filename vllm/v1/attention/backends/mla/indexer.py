@@ -823,9 +823,25 @@ def _supports_native_decode(next_n: int) -> bool:
     return next_n in (1, 2)
 
 
+def _sm90_fp4_indexer_active(vllm_config: VllmConfig) -> bool:
+    """Whether the decode indexer will run the SM90 FP4 Triton kernel.
+
+    That kernel is written for exactly one query row per decode row
+    (``next_n == 1``; see the sparse indexer's decode path).  The capability
+    is declared here explicitly instead of being inherited from DeepGEMM's
+    ``native_next_n_supported`` table -- that table describes a *different*
+    kernel, so relying on it let the builder pick native multi-query rows and
+    then fail at runtime in the SM90 FP4 caller.  Until an SM90 group/next-n
+    variant exists, this path always flattens.
+    """
+    return dsa_indexer_uses_fp4(vllm_config) and has_sm90_fp4_indexer()
+
+
 def _use_flattening(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     next_n = 1 + vllm_config.num_speculative_tokens
+    if _sm90_fp4_indexer_active(vllm_config):
+        return True
     return not _supports_native_decode(next_n) or (
         speculative_config is not None
         and speculative_config.enable_adaptive_verification
@@ -867,6 +883,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             else 0
         )
         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
+        # SM90 FP4 indexer capabilities (one query per row) are declared here,
+        # not inherited from the SM100 DeepGEMM kernel's tables.
+        self.sm90_fp4_indexer = _sm90_fp4_indexer_active(self.vllm_config)
 
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
@@ -875,11 +894,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
-            "(next_n=%d, use_fp4_cache=%s)",
+            "(next_n=%d, use_fp4_cache=%s, sm90_fp4_indexer=%s)",
             self.use_flattening,
             self.supports_varlen,
             next_n,
             self.indexer_uses_fp4,
+            self.sm90_fp4_indexer,
         )
 
         sm_count = num_compute_units(self.device.index)
@@ -1442,7 +1462,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 max_decode_len
             )
             use_native = (
-                not (self.use_flattening or self.supports_varlen)
+                not (
+                    self.use_flattening or self.supports_varlen or self.sm90_fp4_indexer
+                )
                 and max_decode_len <= next_n
                 and step_next_n_ok
             )

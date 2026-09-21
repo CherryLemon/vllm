@@ -69,9 +69,11 @@ def sm90_sparse_mqa_logits_paged_decode(
 
     Thin dispatch over :func:`sm90_fp4_paged_index_logits`: scores only the
     published candidate blocks straight out of the paged MXFP4 indexer cache
-    and returns the token-level logits (the block scores are unused here).
+    and returns the token-level logits.  The candidate ids are already known
+    on this path, so the per-block score reduction is skipped
+    (``write_candidates=False``) -- nothing consumes it.
     """
-    logits, _ = sm90_fp4_paged_index_logits(
+    return sm90_fp4_paged_index_logits(
         q_values,
         q_scale,
         kv_cache,
@@ -81,8 +83,8 @@ def sm90_sparse_mqa_logits_paged_decode(
         candidate_blocks,
         candidate_block_size,
         page_size,
+        write_candidates=False,
     )
-    return logits
 
 
 def sm90_sparse_mqa_logits_prefill_chunk(
@@ -99,9 +101,10 @@ def sm90_sparse_mqa_logits_prefill_chunk(
     """Candidate-token logits for one SM90 compact prefill chunk.
 
     Uses the same packed K gather workspace as the DeepGEMM path, so prefill
-    needs no new gather.
+    needs no new gather.  The candidate ids are already known here, so the
+    per-block score reduction is skipped (``write_candidates=False``).
     """
-    logits, _ = sm90_fp4_workspace_index_logits(
+    return sm90_fp4_workspace_index_logits(
         q_values,
         q_scale,
         weights,
@@ -111,8 +114,8 @@ def sm90_sparse_mqa_logits_prefill_chunk(
         cu_seqlen_ke,
         candidate_blocks,
         candidate_block_size,
+        write_candidates=False,
     )
-    return logits
 
 
 def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:

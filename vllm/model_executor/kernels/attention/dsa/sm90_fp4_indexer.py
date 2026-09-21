@@ -183,11 +183,18 @@ def _sm90_fp4_paged_index_logits_kernel(
     offs_i = tl.arange(0, HALF_D)
 
     n_vis = tl.load(context_lens_ptr + row)
-    valid = offs_l < tl.minimum(n_vis, width)
     if USE_CANDIDATES:
-        # Compact mode: column offs_l belongs to candidate block
-        # offs_l // CANDIDATE_BLOCK_SIZE at within-block offset offs_l % CBS.
-        # -1 padded candidate blocks are skipped (never dereferenced).
+        # Compact mode: ``offs_l`` indexes the candidate *matrix* column
+        # (candidate_blocks.shape[1] * CANDIDATE_BLOCK_SIZE of them), not the
+        # logical compressed context.  It therefore can only be bounded by the
+        # stored row width; visibility is a property of the mapped position
+        # ``logical``.  Comparing the compact column against ``n_vis`` (as the
+        # dense branch legitimately does) silently dropped real candidates:
+        # the production publisher pins each row's newest -- possibly partial --
+        # block first and does not sort the remaining ids, so valid compact
+        # columns routinely extend past ``n_vis`` while invalid ones sit below
+        # it.  -1 padded candidate blocks stay invalid and are never
+        # dereferenced.
         block_col = offs_l // CANDIDATE_BLOCK_SIZE
         within = offs_l % CANDIDATE_BLOCK_SIZE
         block = tl.load(
@@ -196,9 +203,12 @@ def _sm90_fp4_paged_index_logits_kernel(
             other=-1,
         )
         logical = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
-        valid = valid & (block >= 0) & (logical < n_vis)
+        valid = (offs_l < width) & (block >= 0) & (logical < n_vis)
     else:
+        # Dense mode: ``offs_l`` *is* the logical position, so both bounds
+        # apply to the same coordinate.
         logical = offs_l.to(tl.int64)
+        valid = offs_l < tl.minimum(n_vis, width)
 
     # RATIO == 1: slot = block_table[row, L // page_size] * page_size + L % page_size.
     page_idx = tl.load(
@@ -416,6 +426,7 @@ def sm90_fp4_paged_index_logits(
     *,
     width: int | None = None,
     ratio: int = 1,
+    write_candidates: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Score decode rows against the paged MXFP4 indexer K cache on SM90.
 
@@ -436,11 +447,17 @@ def sm90_fp4_paged_index_logits(
             page_size`` (the cache's full compressed capacity).
         ratio: Must be 1.  vLLM's indexer cache is compressed-position
             indexed, so the SGLang ``RATIO`` halving has no vLLM equivalent.
+        write_candidates: In candidate mode, also reduce each candidate
+            block's token logits to a per-block score.  Consumers that already
+            own their candidate ids (the compact decode path) do not read
+            ``candidate_scores``/``candidate_lens``; pass ``False`` to skip the
+            ``[rows, K]`` fp32 allocation and the in-kernel block reduction.
 
     Returns:
-        Dense mode: ``[rows, width]`` fp32 logits, ``-inf`` outside
-        ``context_lens``.  Candidate mode: ``(logits [rows, K*CBS],
-        candidate_scores [rows, K])``.
+        Dense/masked mode: ``[rows, width]`` fp32 logits, ``-inf`` outside
+        ``context_lens``.  Candidate mode with ``write_candidates``:
+        ``(logits [rows, K*CBS], candidate_scores [rows, K])``.  Candidate
+        mode without it: a lone ``[rows, K*CBS]`` logits tensor.
 
     """
     if ratio != 1:
@@ -459,25 +476,25 @@ def sm90_fp4_paged_index_logits(
     assert context_lens.shape == (rows,) and context_lens.dtype == torch.int32
     assert block_table.shape[0] == rows and block_table.stride(-1) == 1
 
-    if candidate_blocks is not None:
+    use_candidates = candidate_blocks is not None
+    if use_candidates:
         assert candidate_block_size > 0
         assert candidate_blocks.shape[0] == rows
         assert page_size % candidate_block_size == 0
         # The score tile reduces a whole number of candidate blocks.
         assert _BLOCK_L % candidate_block_size == 0
-        use_candidates = True
         width = candidate_blocks.shape[1] * candidate_block_size
         num_blocks = candidate_blocks.shape[1]
     else:
-        use_candidates = False
         width = width if width is not None else block_table.shape[1] * page_size
         # Dense mode never publishes candidate scores, so no block count is
         # needed; deriving one here would divide by the (zero) block size.
         num_blocks = 0
+    write_candidates = use_candidates and write_candidates
 
     if rows == 0 or width == 0:
         logits = q_values.new_empty((rows, width), dtype=torch.float32)
-        if use_candidates:
+        if write_candidates:
             return logits, weights.new_empty((rows, num_blocks), dtype=torch.float32)
         return logits
 
@@ -492,16 +509,18 @@ def sm90_fp4_paged_index_logits(
     page_stride = int(cache.stride(0))
 
     logits = torch.empty((rows, width), dtype=torch.float32, device=q_values.device)
-    if use_candidates:
+    if write_candidates:
         candidate_scores = torch.empty(
             (rows, num_blocks), dtype=torch.float32, device=q_values.device
         )
         candidate_lens = torch.empty(rows, dtype=torch.int32, device=q_values.device)
-        cand = candidate_blocks.contiguous()
-        stride_cb = cand.stride(0)
     else:
         candidate_scores = logits
         candidate_lens = context_lens
+    if use_candidates:
+        cand = candidate_blocks.contiguous()
+        stride_cb = cand.stride(0)
+    else:
         cand = context_lens  # unused when USE_CANDIDATES is False
         stride_cb = 0
 
@@ -534,10 +553,10 @@ def sm90_fp4_paged_index_logits(
         BLOCK_L=_BLOCK_L,
         USE_CANDIDATES=use_candidates,
         CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
-        WRITE_CANDIDATES=use_candidates,
+        WRITE_CANDIDATES=write_candidates,
         num_warps=_NUM_WARPS,
     )
-    if use_candidates:
+    if write_candidates:
         return logits, candidate_scores
     return logits
 
@@ -554,6 +573,7 @@ def sm90_fp4_workspace_index_logits(
     candidate_block_size: int = 0,
     *,
     ratio: int = 1,
+    write_candidates: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Score prefill rows against the packed MXFP4 K gather workspace on SM90.
 
@@ -578,21 +598,21 @@ def sm90_fp4_workspace_index_logits(
     assert cu_seqlen_ks.shape == cu_seqlen_ke.shape == (rows,)
     total = k_values.shape[0]
 
-    if candidate_blocks is not None:
+    use_candidates = candidate_blocks is not None
+    if use_candidates:
         assert candidate_block_size > 0
         assert candidate_blocks.shape[0] == rows
         assert _BLOCK_L % candidate_block_size == 0
-        use_candidates = True
         width = candidate_blocks.shape[1] * candidate_block_size
         num_blocks = candidate_blocks.shape[1]
     else:
-        use_candidates = False
         width = total
         num_blocks = 0
+    write_candidates = use_candidates and write_candidates
 
     if rows == 0 or width == 0:
         logits = q_values.new_empty((rows, width), dtype=torch.float32)
-        if use_candidates:
+        if write_candidates:
             return logits, weights.new_empty((rows, num_blocks), dtype=torch.float32)
         return logits
 
@@ -605,14 +625,16 @@ def sm90_fp4_workspace_index_logits(
     cu_seqlen_ke = cu_seqlen_ke.contiguous()
 
     logits = torch.empty((rows, width), dtype=torch.float32, device=q_values.device)
-    if use_candidates:
+    if write_candidates:
         candidate_scores = torch.empty(
             (rows, num_blocks), dtype=torch.float32, device=q_values.device
         )
+    else:
+        candidate_scores = logits
+    if use_candidates:
         cand = candidate_blocks.contiguous()
         stride_cb = cand.stride(0)
     else:
-        candidate_scores = logits
         cand = cu_seqlen_ks
         stride_cb = 0
 
@@ -644,9 +666,9 @@ def sm90_fp4_workspace_index_logits(
         BLOCK_L=_BLOCK_L,
         USE_CANDIDATES=use_candidates,
         CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
-        WRITE_CANDIDATES=use_candidates,
+        WRITE_CANDIDATES=write_candidates,
         num_warps=_NUM_WARPS,
     )
-    if use_candidates:
+    if write_candidates:
         return logits, candidate_scores
     return logits

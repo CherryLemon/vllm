@@ -184,10 +184,17 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
         num_sparse_cols = self.num_sparse_blocks * self.sparse_block_kv
         if not use_sm90:
             check_deep_select_layout(num_sparse_cols, topk_tokens)
-        # Sparse logits are bf16 [rows, num_sparse_cols]; make the prefill
-        # chunker (which budgets fp32 [rows, seq_len]) size chunks as if every
-        # row were this wide.
-        self.min_split_seq_len = (num_sparse_cols * 2 + 3) // 4
+        # Make the prefill chunker (which budgets an fp32 [rows, seq_len]
+        # logits buffer) size chunks as if every row were this wide.  The
+        # SM100 path produces bf16 logits, so a row costs
+        # ``num_sparse_cols * 2`` bytes -> ``num_sparse_cols * 2 / 4`` fp32
+        # budget columns.  The SM90 Triton kernels produce **fp32** logits
+        # (see ``sm90_fp4_paged_index_logits``), so the byte cost is
+        # ``num_sparse_cols * 4`` and the budget must not be halved.
+        logits_itemsize = 4 if use_sm90 else 2
+        self.min_split_seq_len = (
+            num_sparse_cols * logits_itemsize + 3
+        ) // 4
 
         # Rows are indexed by batch token (decode rows first, then prefill
         # chunks by token range), like ``arange_buffer``.

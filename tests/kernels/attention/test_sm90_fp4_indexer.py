@@ -317,6 +317,310 @@ def test_candidate_scores_forced_newest_and_lens():
         assert (logits[1, (k_cand - 1) * cbs :] == float("-inf")).all()
 
 
+@requires_sm90
+def test_compact_logits_cover_every_visible_token_with_unordered_candidates():
+    """Compact candidate columns are *not* logical positions.
+
+    Regression for the SM90 paged kernel's compact mask.  The production
+    candidate publisher pins each row's newest -- possibly partial -- block
+    first and does not sort the remaining ids, so valid compact columns
+    routinely sit past ``n_vis`` while invalid ones sit below it.  Bounding the
+    compact column by ``n_vis`` (correct in dense mode, where the column *is*
+    the logical position) silently dropped every visible token whose compact
+    column happened to land beyond ``n_vis``.
+
+    Oracle: the same query scored in dense mode over the full cache is exactly
+    what the compact path must reproduce, position by position.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    torch.manual_seed(7)
+    device = "cuda"
+    rows, heads, page_size = 2, 32, PAGE_SIZE
+    num_blocks, cbs = 16, 8
+    n_vis = 100
+    # Newest (partial) block first, then the older full blocks; the trailing
+    # -1 entries are padding and must stay -inf.
+    candidates = [12, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1, -1]
+    k_cand = len(candidates)
+    width = k_cand * cbs
+
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    ).repeat(rows, 1)
+    context_lens = torch.full((rows,), n_vis, device=device, dtype=torch.int32)
+    candidate_blocks = torch.tensor(candidates, device=device, dtype=torch.int32)
+    candidate_blocks = candidate_blocks.reshape(1, -1).repeat(rows, 1)
+
+    compact = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=page_size,
+        write_candidates=False,
+    )
+    # The compact consumer already owns its candidate ids: no block scores.
+    assert isinstance(compact, torch.Tensor)
+    assert compact.shape == (rows, width)
+
+    dense = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=num_blocks * page_size,
+    )
+
+    # Every visible position must appear exactly once in the compact row: the
+    # union of the mapped logical positions must be {0, ..., n_vis - 1}.
+    cols = torch.arange(width, device=device)
+    block_col = cols // cbs
+    logic = (
+        candidate_blocks[:, block_col].to(torch.int64) * cbs
+        + (cols % cbs).to(torch.int64)
+    )
+    for r in range(rows):
+        finite = compact[r] != float("-inf")
+        mapped = logic[r][finite]
+        assert mapped.numel() == n_vis, (
+            f"row {r}: compact row exposes {mapped.numel()} finite columns, "
+            f"expected {n_vis} visible tokens"
+        )
+        assert torch.equal(torch.sort(mapped).values, torch.arange(n_vis, device=device))
+
+    # And each finite compact column must carry exactly the dense logits of the
+    # position it maps to.
+    for r in range(rows):
+        finite = compact[r] != float("-inf")
+        torch.testing.assert_close(
+            compact[r][finite],
+            dense[r][logic[r][finite]],
+            rtol=0,
+            atol=0,
+        )
+
+    # -1 padded candidate columns stay -inf even far inside the row width.
+    assert (compact[:, 13 * cbs :] == float("-inf")).all()
+
+
+@requires_sm90
+def test_compact_decode_dspark_block5_rows_are_independent():
+    """DSpark block5 verification shape: 6 query rows per request.
+
+    DSpark drafts ``dspark_block_size`` (5) tokens, so the target verifies
+    1 + 5 = 6 rows per request.  The SM90 FP4 indexer consumes one row per
+    query (the metadata builder is forced to flatten for it), and each row
+    carries its own acceptance-dependent visible length.  A row's finite
+    columns must depend only on that row's own context, so a shorter accepted
+    prefix in one row must not leak into another, and an all-padding row must
+    come back entirely ``-inf``.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    torch.manual_seed(11)
+    device = "cuda"
+    page_size = PAGE_SIZE
+    heads = 32
+    num_blocks, cbs = 16, 8
+    # One request's 6 verification rows: 5 draft positions + the bonus token,
+    # with acceptance shrinking the visible length down the group.  The last
+    # row is a pure padding row (idle rank / unused slot).
+    n_vis_list = [100, 92, 77, 60, 33, 0]
+    rows = len(n_vis_list)
+    candidates = [12, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1, -1]
+    width = len(candidates) * cbs
+
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    ).repeat(rows, 1)
+    context_lens = torch.tensor(n_vis_list, device=device, dtype=torch.int32)
+    candidate_blocks = torch.tensor(candidates, device=device, dtype=torch.int32)
+    candidate_blocks = candidate_blocks.reshape(1, -1).repeat(rows, 1)
+
+    compact = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=page_size,
+        write_candidates=False,
+    )
+    dense = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=num_blocks * page_size,
+    )
+
+    cols = torch.arange(width, device=device)
+    logic = (
+        candidate_blocks[:, cols // cbs].to(torch.int64) * cbs
+        + (cols % cbs).to(torch.int64)
+    )
+    for r, n_vis in enumerate(n_vis_list):
+        finite = compact[r] != float("-inf")
+        mapped = logic[r][finite]
+        assert mapped.numel() == n_vis, (
+            f"row {r} (n_vis={n_vis}) exposes {mapped.numel()} finite columns"
+        )
+        if n_vis == 0:
+            assert not finite.any()
+            continue
+        assert torch.equal(
+            torch.sort(mapped).values, torch.arange(n_vis, device=device)
+        )
+        torch.testing.assert_close(
+            compact[r][finite], dense[r][logic[r][finite]], rtol=0, atol=0
+        )
+
+
+@requires_sm90
+def test_compact_decode_empty_and_single_row_shapes():
+    """Padding-only batches must not fault or read out of bounds.
+
+    ``rows == 0`` is the idle-rank / no-decode-row case and ``topk_tokens``
+    may exceed the compact width on a first step whose candidates are all
+    padding.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    device = "cuda"
+    page_size, heads, num_blocks, cbs = PAGE_SIZE, 32, 16, 8
+    cache = _packed_cache(num_blocks, page_size, device)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    )
+    q_values = _rand_q(1, heads, device)
+    q_scale = _valid_q_scale(1, heads, device)
+    weights = torch.randn(1, heads, device=device, dtype=torch.bfloat16)
+    context_lens = torch.zeros(1, device=device, dtype=torch.int32)
+    # All-padding candidates, with no visible token at all.
+    candidate_blocks = torch.full((1, 16), -1, device=device, dtype=torch.int32)
+
+    logits = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=page_size,
+        write_candidates=False,
+    )
+    assert logits.shape == (1, 16 * cbs)
+    assert (logits == float("-inf")).all()
+
+    empty = sm90_fp4_paged_index_logits(
+        q_values[:0],
+        q_scale[:0],
+        cache,
+        weights[:0],
+        context_lens[:0],
+        block_table[:0],
+        candidate_blocks[:0],
+        cbs,
+        page_size=page_size,
+        write_candidates=False,
+    )
+    assert empty.shape == (0, 16 * cbs)
+
+
+def test_compact_valid_predicate_matches_dense_gather_oracle():
+    """CPU form of the compact-mask contract (no CUDA needed).
+
+    Encodes the kernel's predicate on the same shape the review used as a
+    counterexample, so the coordinate-space rule is pinned down even where the
+    Triton kernel cannot run.  ``test_compact_logits_cover_every_visible_token_
+    with_unordered_candidates`` is the end-to-end guard; this one documents and
+    enforces the contract in CPU-only CI.
+    """
+    cbs, n_vis = 8, 514
+    candidates = [64] + list(range(64)) + [-1] * 8
+    width = len(candidates) * cbs
+    cols = torch.arange(width)
+    block = torch.tensor(candidates)[cols // cbs]
+    logical = block.to(torch.int64) * cbs + (cols % cbs).to(torch.int64)
+
+    fixed = (cols < width) & (block >= 0) & (logical < n_vis)
+    buggy = (cols < min(n_vis, width)) & (block >= 0) & (logical < n_vis)
+
+    # Correct: exactly the n_vis visible logical positions survive.
+    assert int(fixed.sum()) == n_vis
+    assert torch.equal(torch.sort(logical[fixed]).values, torch.arange(n_vis))
+
+    # The compact column index is not a logical position: the old predicate
+    # dropped real candidates whose mapped position is still inside n_vis.
+    assert int(buggy.sum()) < n_vis
+    dropped = logical[fixed & ~buggy]
+    assert dropped.numel() > 0
+    assert bool((dropped < n_vis).all())
+
+
+def test_compact_topk_uses_compact_length_not_logical_context():
+    """The decode top-k must be driven by the compact row width.
+
+    ``logits`` is indexed by compact candidate-matrix column while
+    ``row_ke`` is a logical compressed-KV length; the top-k kernels plan their
+    read range from ``seq_lens``/``max_seq_len``.  Feeding the logical length
+    both reads past the compact row (out of bounds once the context exceeds the
+    compact matrix) and hides valid candidates that sit past it.
+    """
+    from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+
+    width, topk_tokens = 8, 4
+    logits = torch.zeros(1, width, dtype=torch.float32)
+    logits[0, width - 1] = 10.0
+    selected = torch.empty(1, topk_tokens, dtype=torch.int32)
+    topk = get_indexer_topk("torch")
+
+    compact_lens = SparseMQAIndexer._compact_decode_lengths(
+        1, width, torch.device("cpu")
+    )
+    assert compact_lens.dtype == torch.int32
+    assert int(compact_lens.max()) == width
+    topk(logits, compact_lens, 1, selected, topk_tokens, width)
+    assert selected[0, 0].item() == width - 1
+
+    logical_lens = torch.full((1, 1), 4, dtype=torch.int32)
+    topk(logits, logical_lens, 1, selected, topk_tokens, 4)
+    assert selected[0, 0].item() != width - 1, (
+        "a logical context length must not be usable as the compact row length"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure-torch tests (run everywhere)
 # ---------------------------------------------------------------------------

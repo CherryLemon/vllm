@@ -169,3 +169,72 @@ def test_sm90_kernels_reject_ratio_two():
             cu_seqlen_ke=torch.zeros(1, dtype=torch.int32),
             ratio=2,
         )
+
+# ---------------------------------------------------------------------------
+# DSpark speculative-decode capability (DeepSeek-V4.1's MTP-equivalent)
+# ---------------------------------------------------------------------------
+
+
+def _spec_config(kv_dtype: str, num_speculative_tokens: int):
+    """Minimal stand-in for the pieces ``_use_flattening`` touches."""
+    return SimpleNamespace(
+        attention_config=SimpleNamespace(
+            resolve_indexer_kv_dtype=lambda default: kv_dtype
+        ),
+        speculative_config=None,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+
+
+@pytest.mark.parametrize("next_n", [2, 4, 6, 11])
+def test_sm90_fp4_forces_flattening_for_spec_decode(monkeypatch, next_n):
+    """The SM90 FP4 indexer declares one query per row, so decode must flatten.
+
+    Regression: the builder used to decide native multi-query purely from
+    DeepGEMM's ``native_next_n_supported`` table.  That table describes a
+    *different* kernel; on SM90 it reports 2 and 4 as native, so a DSpark/MTP
+    step (``num_speculative_tokens`` 1 or 3 -> next_n 2 or 4) could select
+    native rows and then fail in the SM90 FP4 caller, which only accepts
+    ``next_n == 1``.
+    """
+    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
+    # The DeepGEMM table SM90 would otherwise consult: 2 and 4 are "native".
+    monkeypatch.setattr(
+        indexer_mod, "_supports_native_decode", lambda n: n in (1, 2, 4)
+    )
+
+    cfg = _spec_config("mxfp4", next_n - 1)
+    assert indexer_mod._sm90_fp4_indexer_active(cfg) is True
+    assert indexer_mod._use_flattening(cfg) is True
+
+
+def test_sm90_fp4_capability_is_fp4_only(monkeypatch):
+    """An fp8 indexer cache on SM90 keeps the pre-existing decode layout."""
+    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: False)
+    monkeypatch.setattr(
+        indexer_mod, "_supports_native_decode", lambda n: n in (1, 2, 4)
+    )
+
+    fp8_cfg = _spec_config("fp8", 1)  # next_n == 2
+    assert indexer_mod._sm90_fp4_indexer_active(fp8_cfg) is False
+    # No SM90 FP4 kernel involved -> the DeepGEMM table still governs.
+    assert indexer_mod._use_flattening(fp8_cfg) is False
+
+    # mxfp4 with the opt-in off is still not the SM90 FP4 path.
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: True)
+    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: False)
+    assert indexer_mod._sm90_fp4_indexer_active(_spec_config("mxfp4", 1)) is False
+
+
+def test_dspark_block5_next_n_matches_block_size(monkeypatch):
+    """DSpark block5 verifies 1 + dspark_block_size rows and always flattens."""
+    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
+    monkeypatch.setattr(
+        indexer_mod, "_supports_native_decode", lambda n: n in (1, 2, 4)
+    )
+    # dspark_block_size == 5 -> num_speculative_tokens == 5 -> 6 verify rows.
+    cfg = _spec_config("mxfp4", 5)
+    next_n = 1 + cfg.num_speculative_tokens
+    assert next_n == 6
+    assert indexer_mod._use_flattening(cfg) is True

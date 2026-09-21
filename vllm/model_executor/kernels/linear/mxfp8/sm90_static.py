@@ -41,8 +41,6 @@ Selection is **opt-in and default-off**; see ``Sm90StaticMxfp8LinearKernel``.
 import os
 
 import torch
-import triton
-import triton.language as tl
 from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -53,6 +51,14 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
 )
 from vllm.platforms import current_platform
+
+# Use vLLM's tolerant Triton import: this module is pulled in unconditionally
+# by the public ``kernels.linear`` package (for the backend registry), so a
+# hard ``import triton`` would make the whole linear-kernel registry fail to
+# import on platforms/installs without Triton even when every SM90 opt-in flag
+# is off.  ``vllm.triton_utils`` substitutes a no-op placeholder when Triton is
+# unavailable, and ``is_supported()`` still gates the kernels on SM90.
+from vllm.triton_utils import tl, triton
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -737,9 +743,13 @@ _SM90_GENERIC_CONFIG: dict = {
 
 
 def select_sm90_static_config(N: int, K: int, M: int) -> dict:
-    """Pick the tuned config for (N, K, M), else the generic fallback.
+    """Pick the tuned tile config for (N, K, M), else the generic fallback.
 
-    Mirrors SGLang's ``configs[min(configs, key=|M - key|)]`` lookup.
+    ``M`` only selects *which* verified tile config runs; it is deliberately
+    not a kernel specialization key (see ``sm90_static_gemm``), so an unseen
+    prefill tail length or mixed-batch size reuses an existing binary instead
+    of triggering a fresh JIT compile.  Mirrors SGLang's
+    ``configs[min(configs, key=|M - key|)]`` lookup for the tile choice.
     """
     table = _SM90_STATIC_CONFIGS.get((N, K))
     if table is None:
@@ -755,7 +765,7 @@ def select_sm90_static_config(N: int, K: int, M: int) -> dict:
 # Verbatim port of SGLang fp8_hopper_static.py, with the uint8 ue8m0 decode of
 # ``Bs`` added in-register (see module docstring).
 # ---------------------------------------------------------------------------
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_block_fp8_matmul_hopper_static(
     # Pointers to inputs and output
     A,
@@ -764,7 +774,7 @@ def _w8a8_block_fp8_matmul_hopper_static(
     As,
     Bs,
     # Shape for matmul
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     # Block size for block-wise quantization
@@ -800,7 +810,7 @@ def _w8a8_block_fp8_matmul_hopper_static(
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
@@ -905,6 +915,15 @@ def sm90_static_gemm(
     B:  [N, K] E4M3 (the vLLM weight layout; ``B.T`` is the [K, N] operand).
     As: [M, K // 32] fp32 per-row activation scale.
     Bs: [N, K // 32] uint8 ue8m0 per-row weight scale.
+
+    ``M`` is passed as a *runtime* argument (``do_not_specialize``): the
+    kernel's ``N``/``K``/tile parameters are ``tl.constexpr``, but M is not a
+    valid specialization key here.  vLLM feeds this GEMM an open-ended set of
+    token counts (every eager prefill tail, every mixed-batch size), so a
+    constexpr M would compile a new binary per shape and make the first
+    request of each new bucket pay a JIT spike that CUDA-graph capture cannot
+    absorb.  Bounding compilation to the finite (N, K) config table keeps the
+    verified tile tuning while removing the shape explosion.
     """
     assert A.dtype == MXFP8_VALUE_DTYPE and B.dtype == MXFP8_VALUE_DTYPE
     assert A.stride(-1) == 1, "A groups must be contiguous"

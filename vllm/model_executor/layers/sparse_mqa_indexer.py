@@ -46,6 +46,10 @@ from vllm.v1.attention.backends.mla.sparse_indexer import (
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
+# Row chunk for the SM90 compact prefill top-k fallback.  Bounds the int64
+# index / fp32 mask scratch to `chunk * width` instead of `rows * width`.
+_PREFILL_TOPK_ROW_CHUNK = 64
+
 
 def _prefill_k_workspaces(
     total_seq_lens: int, head_dim: int
@@ -139,25 +143,42 @@ class SparseMQAIndexer(nn.Module):
         if self.use_sm90:
             vllm_config = get_current_vllm_config()
             self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
-            # NOTE: do NOT cache the page size from ``k_cache.cache_config``
-            # here.  ``CacheConfig.block_size`` is still the unresolved default
-            # (16) while the model is being constructed and is only bumped to
-            # the kernel block size the backend requires (64) during worker
-            # init.  The compact path therefore reads the page size off the
-            # bound cache tensor at call time, exactly like the K-cache writer
-            # (``indexer_k_norm_rope_store``) and the dense reader
+            # NOTE: the compact path deliberately keeps no logical context
+            # length on the layer.  ``decode.row_ke`` already carries it per
+            # step, and the top-k stage must NOT be fed it (see
+            # ``_compact_decode_lengths``): that coordinate-space mix-up is what
+            # made the decode top-k plan an out-of-bounds read on long context.
+            #
+            # Page size is equally deliberately not cached: do NOT read it from
+            # ``k_cache.cache_config`` here.  ``CacheConfig.block_size`` is still
+            # the unresolved default (16) while the model is being constructed
+            # and is only bumped to the kernel block size the backend requires
+            # (64) during worker init.  The compact path therefore reads the page
+            # size off the bound cache tensor at call time, exactly like the
+            # K-cache writer (``indexer_k_norm_rope_store``) and the dense reader
             # (``sparse_attn_indexer``) already do.
-            self.max_model_len = (
-                vllm_config.model_config.max_model_len
-                // getattr(k_cache, "compress_ratio", 1)
-            )
 
     def _reserve_workspaces(self, device: torch.device) -> None:
         """Profiling run: claim the K-gather workspace and the peak sparse
-        logits allocation so the memory estimate covers them."""
+        logits allocations so the memory estimate covers them.
+
+        The SM90 compact path is fp32 (not bf16) and its prefill top-k keeps an
+        int64 index matrix and an fp32 mask next to the logits, so reserve that
+        peak as well instead of budgeting from the logits tensor alone.
+        """
         _prefill_k_workspaces(self.max_total_seq_len, self.head_dim)
         max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         torch.empty(max_logits_bytes, dtype=torch.uint8, device=device)
+        if self.use_sm90:
+            # int64 ``logical`` + int32 candidate gather + fp32 ``masked``,
+            # bounded to one chunk of rows by ``_PREFILL_TOPK_ROW_CHUNK``.
+            compact_width = self.candidate_blocks.shape[1] * self.candidate_block_size
+            per_row_bytes = compact_width * (8 + 4 + 4)
+            torch.empty(
+                _PREFILL_TOPK_ROW_CHUNK * per_row_bytes,
+                dtype=torch.uint8,
+                device=device,
+            )
 
     def _forward_sm90(
         self,
@@ -244,8 +265,30 @@ class SparseMQAIndexer(nn.Module):
                     cbs,
                     page_size,
                 )
-                # One query per row (varlen flattening), so the row end is the
-                # query's own visible compressed length.
+                # Two different coordinate spaces meet here and must not be
+                # mixed:
+                #   * ``logits`` is indexed by *compact candidate-matrix
+                #     column* (candidate_blocks.shape[1] * cbs of them);
+                #   * ``decode.row_ke`` is a *logical* compressed-KV length.
+                # ``get_indexer_topk`` derives each row's read range from
+                # ``seq_lens`` and plans it from ``max_seq_len``, so both must
+                # be expressed in the compact column space.  Passing the
+                # logical length (and ``max_model_len``) makes the kernel plan
+                # ``row_ke[row]`` element reads on a row that only holds
+                # ``compact_width`` -- an out-of-bounds read once the context
+                # exceeds the compact matrix, i.e. exactly the long-context
+                # case.
+                #
+                # Invalid compact columns are already ``-inf`` (the logits
+                # kernel masks them), so scanning the full compact row width
+                # keeps every real candidate; ``finalize_candidate_topk_sm90``
+                # re-checks visibility against ``decode.row_ke`` and drops the
+                # ``-inf`` padding.  A tighter "valid candidates packed into a
+                # prefix" layout can replace this later.
+                compact_width = logits.shape[1]
+                compact_lens = self._compact_decode_lengths(
+                    num_rows, compact_width, logits.device
+                )
                 selected = torch.empty(
                     (num_rows, topk_tokens),
                     dtype=torch.int32,
@@ -253,11 +296,11 @@ class SparseMQAIndexer(nn.Module):
                 )
                 get_indexer_topk(self.topk_backend)(
                     logits,
-                    decode.row_ke.view(-1, 1),
+                    compact_lens,
                     1,
                     selected,
                     topk_tokens,
-                    self.max_model_len,
+                    compact_width,
                 )
                 page_scratch = torch.empty_like(selected)
                 finalize_candidate_topk_sm90(
@@ -271,6 +314,35 @@ class SparseMQAIndexer(nn.Module):
                     candidate_block_size=cbs,
                     raw_indices=topk_indices_buffer[:num_rows, :topk_tokens],
                 )
+
+    @staticmethod
+    def _compact_decode_lengths(
+        num_rows: int, compact_width: int, device: torch.device
+    ) -> torch.Tensor:
+        """Per-row decode top-k lengths, in *compact column* space.
+
+        ``SparseMQAIndexer._forward_sm90`` scores candidate-matrix columns and
+        hands the logits to ``get_indexer_topk``, which derives each row's read
+        range from the length tensor and plans it from ``max_seq_len``.  The
+        logical compressed context length (``decode.row_ke``) lives in a
+        different coordinate space: at long context it can exceed the compact
+        row width by orders of magnitude, so passing it makes the kernel read
+        past the row.  Invalid compact columns are already ``-inf``, so every
+        row's length is simply the compact width; visibility is re-checked
+        later by ``finalize_candidate_topk_sm90`` against ``row_ke``.
+
+        The bound is enforced on the Python-side width only.  Do NOT read the
+        tensor back (``.item()``/``max()``) to assert it: this path runs inside
+        CUDA graph capture, where any host sync raises
+        ``cudaErrorStreamCaptureUnsupported``.
+        """
+        assert compact_width > 0, compact_width
+        return torch.full(
+            (num_rows, 1),
+            compact_width,
+            dtype=torch.int32,
+            device=device,
+        )
 
     @staticmethod
     def _prefill_candidate_topk(
@@ -289,28 +361,37 @@ class SparseMQAIndexer(nn.Module):
         the surviving columns are mapped to the request-local compressed
         position ``block * CBS + within``.  This mirrors SGLang's candidate
         prefill remap and keeps only ``O(rows * K * CBS)`` work.
+
+        Rows are processed in chunks: the natural formulation materialises an
+        int64 ``logical`` *and* an fp32 ``masked`` over the whole
+        ``[rows, width]`` matrix, which at a 4096x16384 compact shape is
+        ~0.75 GiB of pure scratch.  Chunking keeps the same arithmetic and
+        bounds the extra allocation by ``chunk_rows * width`` instead of
+        ``rows * width``.
         """
         rows, width = logits.shape
-        if rows == 0 or width == 0:
-            out.fill_(-1)
-            return
-        cols = torch.arange(width, device=logits.device)
-        block = candidate_blocks[:, cols // candidate_block_size]
-        within = cols % candidate_block_size
-        logical = block.to(torch.int64) * candidate_block_size + within
-        valid = (block >= 0) & (
-            (row_ks.to(torch.int64)[:, None] + logical)
-            < row_ke.to(torch.int64)[:, None]
-        )
-        masked = logits.masked_fill(~valid, float("-inf"))
-        k = min(out.shape[1], width)
-        values, indices = torch.topk(masked, k, dim=-1)
-        selected = torch.gather(logical, 1, indices)
-        selected = torch.where(
-            values > float("-inf"), selected, torch.full_like(selected, -1)
-        ).to(torch.int32)
         out.fill_(-1)
-        out[:, :k] = selected
+        if rows == 0 or width == 0:
+            return
+        k = min(out.shape[1], width)
+        cols = torch.arange(width, device=logits.device)
+        block_col = cols // candidate_block_size
+        within = (cols % candidate_block_size).to(torch.int64)
+        for start in range(0, rows, _PREFILL_TOPK_ROW_CHUNK):
+            end = min(start + _PREFILL_TOPK_ROW_CHUNK, rows)
+            cand = candidate_blocks[start:end, block_col]
+            logical = cand.to(torch.int64) * candidate_block_size + within
+            valid = (cand >= 0) & (
+                (row_ks[start:end].to(torch.int64)[:, None] + logical)
+                < row_ke[start:end].to(torch.int64)[:, None]
+            )
+            masked = logits[start:end].masked_fill(~valid, float("-inf"))
+            values, indices = torch.topk(masked, k, dim=-1)
+            selected = torch.gather(logical, 1, indices)
+            selected = torch.where(
+                values > float("-inf"), selected, torch.full_like(selected, -1)
+            ).to(torch.int32)
+            out[start:end, :k] = selected
 
     def forward(
         self,
