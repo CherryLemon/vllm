@@ -28,7 +28,23 @@
 # Environment variables:
 #   MODEL_PATH          - checkpoint path (default /public-nvme/models/DeepSeek-V4.1-Flash)
 #   SERVED_NAME         - served model name (default deepseek-v4.1-flash)
-#   TP                  - tensor parallel size per instance (default 8)
+#   TP                  - tensor parallel size for BOTH instances (default 8)
+#   PREFILL_TP / DECODE_TP - per-instance tensor parallel override (default TP)
+#   PREFILL_DP / DECODE_DP - internal data-parallel size per instance (default 1).
+#                         NixlConnector PD supports heterogeneous TP for MLA
+#                         (the KV cache is replicated across TP workers, so there
+#                         is no head splitting) and data parallel is universally
+#                         supported, so e.g. the documented target topology is
+#
+#                           PREFILL_TP=8 PREFILL_DP=1 \
+#                           DECODE_TP=2  DECODE_DP=4    # attention TP2 x DP4, EP8
+#
+#                         Both instances must use the same attention backend and
+#                         KV cache dtype, and the same block size (this model is
+#                         hybrid SWA + full attention, which requires HMA and so
+#                         forbids heterogeneous block sizes).  DP ranks bind
+#                         side-channel ports base_port + dp_rank, so keep the two
+#                         port ranges disjoint (5600 for P, 5610 for D).
 #   MAX_MODEL_LEN       - (default 32768)
 #   GPU_MEMORY_UTILIZATION - (default 0.88)
 #   PREFILL_PORT        - (default 8200)
@@ -56,6 +72,13 @@ ROLE="${ROLE:-all}"
 MODEL_PATH="${MODEL_PATH:-/public-nvme/models/DeepSeek-V4.1-Flash}"
 SERVED_NAME="${SERVED_NAME:-deepseek-v4.1-flash}"
 TP="${TP:-8}"
+# Per-instance parallelism: heterogeneous PD needs P and D to differ, and
+# decode-side DP is expressed as data_parallel_size (internal "mp" backend, so
+# one API server fronts every rank).
+PREFILL_TP="${PREFILL_TP:-$TP}"
+DECODE_TP="${DECODE_TP:-$TP}"
+PREFILL_DP="${PREFILL_DP:-1}"
+DECODE_DP="${DECODE_DP:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.88}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
@@ -66,8 +89,10 @@ BLOCK_SIZE="${BLOCK_SIZE:-}"
 PREFILL_PORT="${PREFILL_PORT:-8200}"
 DECODE_PORT="${DECODE_PORT:-8300}"
 PROXY_PORT="${PROXY_PORT:-8192}"
+# DP ranks bind base_port + dp_rank, so the two ranges must not overlap; the
+# old decode default (5601) left no headroom for decode-side DP.
 PREFILL_SIDE_CHANNEL_PORT="${PREFILL_SIDE_CHANNEL_PORT:-5600}"
-DECODE_SIDE_CHANNEL_PORT="${DECODE_SIDE_CHANNEL_PORT:-5601}"
+DECODE_SIDE_CHANNEL_PORT="${DECODE_SIDE_CHANNEL_PORT:-5610}"
 NIXL_SIDE_CHANNEL_HOST="${NIXL_SIDE_CHANNEL_HOST:-127.0.0.1}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
@@ -217,7 +242,6 @@ common_args() {
   COMMON_ARGS=(
     --model "$MODEL_PATH"
     --served-model-name "$SERVED_NAME"
-    --tensor-parallel-size "$TP"
     --enable-expert-parallel
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
@@ -249,34 +273,53 @@ common_args() {
 # under ``setsid`` so the recorded PID is the service itself.  ``env`` carries
 # the per-service NIXL channel variables without relying on inline
 # ``VAR=value cmd`` parsing.
+# `--tensor-parallel-size` / `--data-parallel-size` are per instance: a
+# heterogeneous PD pair must not share them.  `--enable-expert-parallel` stays
+# common, so EP spans TP * DP ranks on each side (P TP8/DP1 -> EP8,
+# D TP2xDP4 -> EP8).
+parallel_args() {
+  local tp="$1" dp="$2" rank_gpus
+  rank_gpus=$((tp * dp))
+  if (( rank_gpus > 8 )); then
+    log "FAIL: TP ${tp} x DP ${dp} = ${rank_gpus} GPUs, this harness has 8"
+    return 1
+  fi
+  PARALLEL_ARGS=(--tensor-parallel-size "$tp")
+  if (( dp > 1 )); then
+    PARALLEL_ARGS+=(--data-parallel-size "$dp")
+  fi
+}
+
 prefill_cmd() {
   common_args
+  parallel_args "$PREFILL_TP" "$PREFILL_DP"
   CMD=(
     env
     "VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}"
     "VLLM_NIXL_SIDE_CHANNEL_PORT=${PREFILL_SIDE_CHANNEL_PORT}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
-    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}"
+    "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}"
     --port "$PREFILL_PORT"
     --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
     --speculative-config "$PREFILL_SPEC_CONFIG"
   )
-  log "prefill instance on port ${PREFILL_PORT} (graphs=$ENABLE_GRAPHS)"
+  log "prefill instance on port ${PREFILL_PORT} (TP=$PREFILL_TP DP=$PREFILL_DP graphs=$ENABLE_GRAPHS)"
 }
 
 decode_cmd() {
   common_args
+  parallel_args "$DECODE_TP" "$DECODE_DP"
   CMD=(
     env
     "VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}"
     "VLLM_NIXL_SIDE_CHANNEL_PORT=${DECODE_SIDE_CHANNEL_PORT}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
-    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}"
+    "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}"
     --port "$DECODE_PORT"
     --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
     --speculative-config "$DECODE_SPEC_CONFIG"
   )
-  log "decode instance on port ${DECODE_PORT} (graphs=$ENABLE_GRAPHS)"
+  log "decode instance on port ${DECODE_PORT} (TP=$DECODE_TP DP=$DECODE_DP graphs=$ENABLE_GRAPHS)"
 }
 
 proxy_cmd() {
@@ -326,6 +369,12 @@ case "$ROLE" in
     printf 'DECODE_SPEC_CONFIG=%s\n' "$DECODE_SPEC_CONFIG"
     printf 'DECODE_HOST=%s\n' "$DECODE_HOST"
     printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
+    printf 'PREFILL_TP=%s\n' "$PREFILL_TP"
+    printf 'DECODE_TP=%s\n' "$DECODE_TP"
+    printf 'PREFILL_DP=%s\n' "$PREFILL_DP"
+    printf 'DECODE_DP=%s\n' "$DECODE_DP"
+    printf 'PREFILL_SIDE_CHANNEL_PORT=%s\n' "$PREFILL_SIDE_CHANNEL_PORT"
+    printf 'DECODE_SIDE_CHANNEL_PORT=%s\n' "$DECODE_SIDE_CHANNEL_PORT"
     printf 'COMMON_ARGS_COUNT=%d\n' "${#COMMON_ARGS[@]}"
     printf 'COMMON_ARGS=%s\n' "$(printf '%s\x1f' "${COMMON_ARGS[@]}")"
     printf 'GRAPH_ARGS_COUNT=%d\n' "${#GRAPH_ARGS[@]}"

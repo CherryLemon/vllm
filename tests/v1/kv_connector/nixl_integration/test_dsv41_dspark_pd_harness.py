@@ -21,7 +21,6 @@ These are local (CPU) checks; no server is started.
 
 import json
 import os
-
 import subprocess
 from pathlib import Path
 
@@ -163,8 +162,12 @@ def test_services_are_killed_by_process_group_not_wrapper_shell():
     assert "exec \"$@\"" in code
     # Group kill (negative PID), TERM before KILL, with a grace period.
     assert 'kill -"$sig" -- "-${pid}"' in code
-    term_lines = [line for line in code.splitlines() if 'kill_service "$pidfile" TERM' in line]
-    kill_lines = [line for line in code.splitlines() if 'kill_service "$pidfile" KILL' in line]
+    term_lines = [
+        line for line in code.splitlines() if 'kill_service "$pidfile" TERM' in line
+    ]
+    kill_lines = [
+        line for line in code.splitlines() if 'kill_service "$pidfile" KILL' in line
+    ]
     assert term_lines and kill_lines
     term_idx = code.index('kill_service "$pidfile" TERM')
     kill_idx = code.index('kill_service "$pidfile" KILL')
@@ -200,3 +203,80 @@ def test_dev_mode_is_on_so_the_test_can_reset_caches():
     assert cfg["VLLM_SERVER_DEV_MODE"] == "1"
     cfg = harness_config(VLLM_SERVER_DEV_MODE="0")
     assert cfg["VLLM_SERVER_DEV_MODE"] == "0"
+
+def test_default_parallelism_is_homogeneous_tp8():
+    """The verified baseline: P and D both TP8, no DP, disjoint NIXL ports."""
+    cfg = harness_config()
+    assert cfg["PREFILL_TP"] == cfg["DECODE_TP"] == "8"
+    assert cfg["PREFILL_DP"] == cfg["DECODE_DP"] == "1"
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        args = args_of(cfg, key)
+        assert args[args.index("--tensor-parallel-size") + 1] == "8"
+        assert "--data-parallel-size" not in args
+    # DP ranks bind base_port + dp_rank, so the ranges must not overlap.
+    p_base = int(cfg["PREFILL_SIDE_CHANNEL_PORT"])
+    d_base = int(cfg["DECODE_SIDE_CHANNEL_PORT"])
+    assert d_base >= p_base + int(cfg["PREFILL_DP"])
+
+
+def test_heterogeneous_pd_splits_tp_and_adds_decode_dp():
+    """The documented target: P TP8/EP8, D attention TP2 x DP4/EP8.
+
+    Regression: the harness had a single `TP` for both instances, so the
+    heterogeneous topology could not even be expressed.
+    """
+    cfg = harness_config(DECODE_TP="2", DECODE_DP="4")
+    prefill = args_of(cfg, "PREFILL_CMD")
+    decode = args_of(cfg, "DECODE_CMD")
+
+    assert cfg["PREFILL_TP"] == "8" and cfg["PREFILL_DP"] == "1"
+    assert prefill[prefill.index("--tensor-parallel-size") + 1] == "8"
+    assert "--data-parallel-size" not in prefill
+
+    assert cfg["DECODE_TP"] == "2" and cfg["DECODE_DP"] == "4"
+    assert decode[decode.index("--tensor-parallel-size") + 1] == "2"
+    assert decode[decode.index("--data-parallel-size") + 1] == "4"
+
+    # EP spans TP * DP ranks on each side, so both stay EP8.
+    assert "--enable-expert-parallel" in prefill
+    assert "--enable-expert-parallel" in decode
+    # Roles are unchanged by the parallel split.
+    assert json.loads(prefill[prefill.index("--kv-transfer-config") + 1]) == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_producer",
+    }
+    assert json.loads(decode[decode.index("--kv-transfer-config") + 1]) == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_consumer",
+    }
+    # DSpark stays on both sides (a compatibility-hash requirement), and only
+    # the draft depth may differ.
+    assert json.loads(prefill[prefill.index("--speculative-config") + 1]) == {
+        "method": "dspark",
+        "num_speculative_tokens": 1,
+    }
+    assert json.loads(decode[decode.index("--speculative-config") + 1]) == {
+        "method": "dspark",
+        "num_speculative_tokens": 5,
+    }
+
+
+def test_parallel_sizes_must_fit_the_node():
+    """TP x DP is a GPU count, and the harness has eight."""
+    # print-config builds both commands, so an over-subscribed decode must make
+    # the script fail loudly instead of launching a partial instance.
+    proc = subprocess.run(
+        ["bash", str(HARNESS)],
+        env={
+            **os.environ,
+            "ROLE": "print-config",
+            "DECODE_TP": "4",
+            "DECODE_DP": "4",
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "FAIL: TP" in combined and "this harness has 8" in combined, combined
