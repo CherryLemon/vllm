@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SM90_FP4_INDEXER: bool = False
     VLLM_SM90_FP4_GROUP6: bool = False
+    VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES: bool = False
     VLLM_SM90_FP8_BLOCK32_STATIC: bool = False
     VLLM_SM90_MHC_SPLIT_H: bool = False
     VLLM_MHC_DISPATCH_STATS: bool = False
@@ -1109,6 +1110,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # failed guard falls back to the existing one-row-per-CTA kernel.  Default
     # off: the default launch shape and every non-admitted step are unchanged.
     "VLLM_SM90_FP4_GROUP6": lambda: bool(int(os.getenv("VLLM_SM90_FP4_GROUP6", "0"))),
+    # Opt-in early exit for the SM90 FP4 indexer-logits kernels: a grid tile
+    # whose columns map to no visible position writes its ``-inf`` outputs and
+    # returns before the Q load / K decode / tl.dot.  Skipped entirely when the
+    # flag is off (the branch is a constexpr-gated no-op).  SGLang's matching
+    # opt-in is SGLANG_OPT_DSV41_INDEXER_SKIP_INVALID_TILES.
+    "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES": lambda: bool(
+        int(os.getenv("VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES", "0"))
+    ),
     # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM (WP B). Default
     # off: family(90) keeps the Marlin W8A16 fallback and SM100 is unchanged.
     "VLLM_SM90_FP8_BLOCK32_STATIC": lambda: bool(

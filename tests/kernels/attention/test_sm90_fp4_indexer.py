@@ -1309,3 +1309,252 @@ def test_compact_decode_chain_matches_dense_candidate_oracle(
         for pos in got:
             assert pos < n_vis, f"remapped position {pos} is outside n_vis={n_vis}"
             assert (pos % cbs) < cbs and (pos // cbs) in cand_ids, pos
+
+
+# ---------------------------------------------------------------------------
+# Early exit for fully invisible tiles (SKIP_INVALID)
+# ---------------------------------------------------------------------------
+#
+# ``VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES`` is a *performance* transform: a
+# grid tile with no visible column writes its ``-inf`` outputs and returns
+# before the Q load / K decode / ``tl.dot``.  The numeric contract is bit
+# equality with the flag off.
+
+_SKIP_ENV = "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"
+
+
+def _assert_outputs_identical(a, b):
+    if isinstance(a, tuple):
+        assert isinstance(b, tuple) and len(a) == len(b), (type(a), type(b))
+        for x, y in zip(a, b):
+            torch.testing.assert_close(x, y, rtol=0, atol=0)
+    else:
+        assert isinstance(b, torch.Tensor)
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def _run_with_skip(monkeypatch, skip: bool, fn):
+    if skip:
+        monkeypatch.setenv(_SKIP_ENV, "1")
+    else:
+        monkeypatch.delenv(_SKIP_ENV, raising=False)
+    return fn()
+
+
+@requires_sm90
+@pytest.mark.parametrize("mode", ["dense", "compact"])
+@pytest.mark.parametrize("write_candidates", [False, True])
+def test_skip_invalid_tiles_paged_is_bit_exact(
+    monkeypatch, mode: str, write_candidates: bool
+):
+    """Paged kernel: flag on/off produce identical outputs, dense and compact.
+
+    ``width`` is deliberately not a multiple of ``_BLOCK_L`` so the partial
+    last tile and the ``offs_l < width`` store mask are exercised too.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    torch.manual_seed(101)
+    device = "cuda"
+    heads, page_size, cbs = 32, PAGE_SIZE, 8
+    num_blocks = 16
+    cache = _packed_cache(num_blocks, page_size, device)
+
+    if mode == "dense":
+        width = 1000  # not a multiple of BLOCK_L
+        n_vis = [0, 1, 63, 64, 65, 513, width]
+        rows = len(n_vis)
+        block_table = torch.arange(
+            (width + page_size - 1) // page_size, device=device, dtype=torch.int32
+        ).reshape(1, -1).repeat(rows, 1)
+        context_lens = torch.tensor(n_vis, device=device, dtype=torch.int32)
+        candidate_blocks, cb_arg = None, 0
+    else:
+        k_cand = 15
+        width = k_cand * cbs  # 120, not a multiple of BLOCK_L
+        rows = 3
+        block_table = torch.arange(
+            num_blocks, device=device, dtype=torch.int32
+        ).reshape(1, -1).repeat(rows, 1)
+        context_lens = torch.tensor([100, 4, 0], device=device, dtype=torch.int32)
+        # Row 0: newest (partial) block pinned first, older ids unordered, -1
+        # padding.  Row 1: one real block then padding.  Row 2: all padding.
+        row = [12] + list(range(12)) + [-1, -1]
+        candidate_blocks = torch.tensor(row, device=device, dtype=torch.int32)
+        candidate_blocks = candidate_blocks.reshape(1, -1).repeat(rows, 1)
+        candidate_blocks[1] = torch.tensor(
+            [0] + [-1] * (k_cand - 1), device=device, dtype=torch.int32
+        )
+        candidate_blocks[2] = -1
+        cb_arg = cbs
+
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+
+    def call():
+        return sm90_fp4_paged_index_logits(
+            q_values,
+            q_scale,
+            cache,
+            weights,
+            context_lens,
+            block_table,
+            candidate_blocks,
+            cb_arg,
+            page_size=page_size,
+            width=width if mode == "dense" else None,
+            write_candidates=write_candidates,
+        )
+
+    base = _run_with_skip(monkeypatch, False, call)
+    got = _run_with_skip(monkeypatch, True, call)
+    _assert_outputs_identical(base, got)
+
+    # The all-invisible rows stay entirely -inf with the flag on.
+    logits = got[0] if isinstance(got, tuple) else got
+    for r, n in enumerate(context_lens.tolist()):
+        if n == 0:
+            assert (logits[r] == float("-inf")).all()
+
+
+@requires_sm90
+@pytest.mark.parametrize("mode", ["dense", "compact"])
+@pytest.mark.parametrize("write_candidates", [False, True])
+def test_skip_invalid_tiles_workspace_is_bit_exact(
+    monkeypatch, mode: str, write_candidates: bool
+):
+    """Workspace (prefill) kernel: flag on/off produce identical outputs.
+
+    Dense rows span empty intervals (``ks == ke``), a prefix-only interval and
+    a suffix-only interval; the compact case has an unordered candidate row and
+    two all-padding rows.  ``total`` is not a multiple of ``_BLOCK_L``.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_workspace_index_logits,
+    )
+
+    torch.manual_seed(202)
+    device = "cuda"
+    heads, cbs = 32, 8
+
+    if mode == "dense":
+        total, rows = 100, 7  # not a multiple of BLOCK_L
+        ks_list = [0, 0, 10, 60, 100, 0, 99]
+        ke_list = [0, 100, 10, 100, 100, 1, 100]
+        candidate_blocks, cb_arg = None, 0
+    else:
+        total, rows = 200, 3
+        ks_list = [0, 100, 0]
+        ke_list = [100, 100, 0]
+        row = [12] + list(range(12)) + [-1, -1]
+        candidate_blocks = torch.tensor(row, device=device, dtype=torch.int32)
+        candidate_blocks = candidate_blocks.reshape(1, -1).repeat(rows, 1)
+        candidate_blocks[1] = -1
+        candidate_blocks[2] = -1
+        cb_arg = cbs
+
+    k_values = torch.randint(0, 256, (total, HALF_D), device=device, dtype=torch.uint8)
+    k_scales = torch.randint(
+        _SCALE_EXP_LO, _SCALE_EXP_HI + 1, (total, SCALE_BYTES), device=device,
+        dtype=torch.uint8,
+    )
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    ks = torch.tensor(ks_list, device=device, dtype=torch.int32)
+    ke = torch.tensor(ke_list, device=device, dtype=torch.int32)
+
+    def call():
+        return sm90_fp4_workspace_index_logits(
+            q_values,
+            q_scale,
+            weights,
+            k_values,
+            k_scales,
+            ks,
+            ke,
+            candidate_blocks,
+            cb_arg,
+            write_candidates=write_candidates,
+        )
+
+    base = _run_with_skip(monkeypatch, False, call)
+    got = _run_with_skip(monkeypatch, True, call)
+    _assert_outputs_identical(base, got)
+
+    logits = got[0] if isinstance(got, tuple) else got
+    for r in range(rows):
+        if ks_list[r] == ke_list[r]:
+            assert (logits[r] == float("-inf")).all()
+
+
+def _tile_skip_from_valid(valid: torch.Tensor, block_l: int) -> torch.Tensor:
+    """The kernel predicate: a tile is skipped iff none of its columns is valid."""
+    n = valid.numel()
+    ntile = (n + block_l - 1) // block_l
+    pad = ntile * block_l - n
+    if pad:
+        valid = torch.cat([valid, torch.zeros(pad, dtype=torch.bool)])
+    return ~valid.reshape(ntile, block_l).any(dim=1)
+
+
+def test_skip_invalid_tile_predicates_match_body_valid_cpu():
+    """CPU pin for the early-exit predicates (the Triton kernels need a GPU).
+
+    "Tile invisible" means exactly "the body's ``valid`` is false for every
+    column of the tile".  Dense mode may use the tile start because ``offs_l``
+    *is* the logical position; compact mode derives visibility from the mapped
+    position, and the dense-style tile-start bound is shown to over-skip.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import _BLOCK_L
+
+    block_l, cbs, n_vis = _BLOCK_L, 8, 100
+    # Unordered compact candidates: block 12 sits at compact index 16, so its
+    # visible logical positions (96..99) land in tile [128, 192) -- whose start
+    # is already >= n_vis.  The rest are padding.
+    candidates = list(range(12)) + [13, 14, 15, 16, 12, -1, -1, -1]
+    width = len(candidates) * cbs
+    cols = torch.arange(width)
+    block = torch.tensor(candidates)[cols // cbs]
+    logical = block.to(torch.int64) * cbs + (cols % cbs).to(torch.int64)
+
+    # Paged compact body predicate and early exit.
+    valid = (cols < width) & (block >= 0) & (logical < n_vis)
+    assert int(valid.sum()) == n_vis
+    correct = _tile_skip_from_valid(valid, block_l)
+    tile_start = torch.arange(correct.numel()) * block_l
+    buggy = tile_start >= min(n_vis, width)
+    assert bool((buggy & ~correct).any()), (
+        "the dense-style tile bound must over-skip with unordered candidates"
+    )
+
+    # Paged dense: offs_l is the logical position, so the tile bound is exact.
+    dense_valid = cols < min(n_vis, width)
+    dense_skip = tile_start >= min(n_vis, width)
+    assert torch.equal(dense_skip, _tile_skip_from_valid(dense_valid, block_l))
+
+    # Workspace dense: absolute interval [ks, ke).
+    intervals = [(0, 0), (0, 100), (10, 10), (60, 100), (100, 100), (0, 1), (99, 100)]
+    for ks, ke in intervals:
+        ws_valid = (cols < width) & (cols >= ks) & (cols < ke)
+        starts = torch.arange(correct.numel()) * block_l
+        ws_skip = (starts >= ke) | (starts + block_l <= ks)
+        ideal = _tile_skip_from_valid(ws_valid, block_l)
+        # Soundness: never skip a tile that still holds a visible column.
+        assert not bool((ws_skip & ~ideal).any()), (ks, ke)
+        # For a non-empty interval the predicate is exact; an empty interval
+        # (``ks == ke``) inside a tile is conservatively *not* skipped, which
+        # still writes the right ``-inf`` through the body.
+        if ks < ke:
+            assert torch.equal(ws_skip, ideal), (ks, ke)
+
+    # Workspace compact: visibility is ``ks + logical < ke``, not the column.
+    ks, ke = 0, n_vis
+    k_row = ks + logical
+    ws_valid = (cols < width) & (block >= 0) & (k_row < ke)
+    assert int(ws_valid.sum()) == n_vis
+    ws_correct = _tile_skip_from_valid(ws_valid, block_l)
+    assert bool((buggy & ~ws_correct).any())

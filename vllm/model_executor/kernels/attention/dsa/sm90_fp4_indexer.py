@@ -182,6 +182,7 @@ def _sm90_fp4_paged_index_logits_kernel(
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
     WRITE_CANDIDATES: tl.constexpr,
+    SKIP_INVALID: tl.constexpr,
 ):
     row = tl.program_id(0)
     lb = tl.program_id(1)
@@ -190,6 +191,60 @@ def _sm90_fp4_paged_index_logits_kernel(
     offs_i = tl.arange(0, HALF_D)
 
     n_vis = tl.load(context_lens_ptr + row)
+    if SKIP_INVALID:
+        # A fully invisible tile used to run the masked K load, the Q load and
+        # both ``tl.dot``s only to overwrite every result with ``-inf``.  Exit
+        # before that work, writing exactly what the body would have written.
+        #
+        # The two modes need *different* "no visible column" predicates.
+        # Dense: ``offs_l`` is the logical position, so the tile start bound is
+        # sound.  Compact: ``offs_l`` is a candidate-matrix column, so
+        # visibility must be re-derived from the mapped ``logical`` position.
+        # Never compare a compact column against ``n_vis`` here; see the body's
+        # comment for the coordinate-space bug that caused.
+        if USE_CANDIDATES:
+            block_col = offs_l // CANDIDATE_BLOCK_SIZE
+            within = offs_l % CANDIDATE_BLOCK_SIZE
+            block = tl.load(
+                candidate_blocks_ptr + row * stride_cb + block_col,
+                mask=offs_l < width,
+                other=-1,
+            )
+            logical = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
+            visible = (offs_l < width) & (block >= 0) & (logical < n_vis)
+            tile_invisible = tl.sum(visible.to(tl.int32), axis=0) == 0
+        else:
+            tile_invisible = lb * BLOCK_L >= tl.minimum(n_vis, width)
+        if tile_invisible:
+            tl.store(
+                out_ptr + row * stride_out + offs_l,
+                -float("inf"),
+                mask=offs_l < width,
+            )
+            if WRITE_CANDIDATES:
+                # Reproduce this kernel's own all-``-inf`` tail, including the
+                # forced +inf on the newest visible *logical* block.
+                blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
+                block_ids = lb * blocks_per_tile + tl.arange(0, blocks_per_tile)
+                num_blocks = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+                last_block = (n_vis - 1) // CANDIDATE_BLOCK_SIZE
+                block_scores = tl.full((blocks_per_tile,), float("-inf"), tl.float32)
+                block_scores = tl.where(
+                    (n_vis > 0) & (block_ids == last_block) & (block_ids < num_blocks),
+                    float("inf"),
+                    block_scores,
+                )
+                tl.store(
+                    candidate_scores_ptr + row * stride_cs + block_ids,
+                    block_scores,
+                    mask=block_ids < num_blocks,
+                )
+                tl.store(
+                    candidate_lens_ptr + row,
+                    (n_vis + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE,
+                    mask=lb == 0,
+                )
+            return
     if USE_CANDIDATES:
         # Compact mode: ``offs_l`` indexes the candidate *matrix* column
         # (candidate_blocks.shape[1] * CANDIDATE_BLOCK_SIZE of them), not the
@@ -669,6 +724,7 @@ def _sm90_fp4_workspace_index_logits_kernel(
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
     WRITE_CANDIDATES: tl.constexpr,
+    SKIP_INVALID: tl.constexpr,
 ):
     row = tl.program_id(0)
     lb = tl.program_id(1)
@@ -678,6 +734,44 @@ def _sm90_fp4_workspace_index_logits_kernel(
 
     ks = tl.load(cu_ks_ptr + row)
     ke = tl.load(cu_ke_ptr + row)
+    if SKIP_INVALID:
+        # Same early exit as the paged kernel.  Dense visibility here is the
+        # absolute workspace interval ``[ks, ke)``; compact visibility is again
+        # a property of the mapped workspace row ``ks + logical`` and never of
+        # the candidate-matrix column ``offs_l``.
+        if USE_CANDIDATES:
+            block_col = offs_l // CANDIDATE_BLOCK_SIZE
+            within = offs_l % CANDIDATE_BLOCK_SIZE
+            block = tl.load(
+                candidate_blocks_ptr + row * stride_cb + block_col,
+                mask=offs_l < width,
+                other=-1,
+            )
+            logical = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
+            k_row = ks.to(tl.int64) + logical
+            visible = (offs_l < width) & (block >= 0) & (k_row < ke)
+            tile_invisible = tl.sum(visible.to(tl.int32), axis=0) == 0
+        else:
+            tile_invisible = (lb * BLOCK_L >= ke) | ((lb + 1) * BLOCK_L <= ks)
+        if tile_invisible:
+            tl.store(
+                out_ptr + row * stride_out + offs_l,
+                -float("inf"),
+                mask=offs_l < width,
+            )
+            if WRITE_CANDIDATES:
+                # This kernel's tail has no forced +inf newest block (the
+                # candidate publisher applies that), so an all-``-inf`` tile
+                # stores plain ``-inf`` block scores.
+                blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
+                block_ids = lb * blocks_per_tile + tl.arange(0, blocks_per_tile)
+                num_blocks = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+                tl.store(
+                    candidate_scores_ptr + row * stride_cs + block_ids,
+                    tl.full((blocks_per_tile,), float("-inf"), tl.float32),
+                    mask=block_ids < num_blocks,
+                )
+            return
     if USE_CANDIDATES:
         block_col = offs_l // CANDIDATE_BLOCK_SIZE
         within = offs_l % CANDIDATE_BLOCK_SIZE
@@ -974,6 +1068,7 @@ def sm90_fp4_paged_index_logits(
         USE_CANDIDATES=use_candidates,
         CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
         WRITE_CANDIDATES=write_candidates,
+        SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
         num_warps=_NUM_WARPS,
     )
     if write_candidates:
@@ -1087,6 +1182,7 @@ def sm90_fp4_workspace_index_logits(
         USE_CANDIDATES=use_candidates,
         CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
         WRITE_CANDIDATES=write_candidates,
+        SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
         num_warps=_NUM_WARPS,
     )
     if write_candidates:
