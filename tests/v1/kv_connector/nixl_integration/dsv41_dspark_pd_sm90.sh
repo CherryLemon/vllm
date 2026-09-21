@@ -65,10 +65,15 @@
 #   MOONCAKE_ABORT_REQUEST_TIMEOUT - forwarded when set; how long the producer
 #                         keeps blocks for an unsent transfer before freeing
 #                         them (connector default 480 s)
-#   MOONCAKE_FORCE_HCA  - forwarded as the Mooncake transfer engine's
-#                         MC_FORCE_HCA when set.  Needed on a multi-rail host:
-#                         each side's topology discovery otherwise picks its own
-#                         device and RDMA writes time out across fabrics.
+#   MOONCAKE_DEVICE_NAME - comma-separated RDMA devices the Mooncake transfer
+#                         engine may use (kv_connector_extra_config.device_name).
+#                         Needed on a multi-rail host: with the default (empty)
+#                         each side's topology discovery picks its own HCA set --
+#                         measured here, one side landed on the management bond
+#                         and the other on a 100.75.4.x rail -- and every RDMA
+#                         write then fails with "transport retry counter
+#                         exceeded".  The engine's own MC_FORCE_HCA is *not* an
+#                         alternative: it takes an integer, not a device name.
 #   PREFILL_HOSTS / DECODE_HOSTS - comma-separated host list for the proxy
 #   PROXY_HOST          - host the proxy listens on (default 127.0.0.1)
 #   DECODE_HOST         - host the *test* reads decode /metrics from
@@ -123,9 +128,9 @@ DECODE_MOONCAKE_BOOTSTRAP_PORT="${DECODE_MOONCAKE_BOOTSTRAP_PORT:-8999}"
 # the transfer engine's default (peermem on).
 WITH_NVIDIA_PEERMEM="${WITH_NVIDIA_PEERMEM:-}"
 MOONCAKE_ABORT_REQUEST_TIMEOUT="${MOONCAKE_ABORT_REQUEST_TIMEOUT:-}"
-# Mooncake transfer-engine rail (MC_FORCE_HCA); empty = engine's own discovery.
-# Both instances must name the same rail, or the RDMA writes hang.
-MOONCAKE_FORCE_HCA="${MOONCAKE_FORCE_HCA:-}"
+# RDMA rail(s) the Mooncake transfer engine may use; empty = engine discovery.
+# Both instances must name the same rail, or RDMA writes fail across fabrics.
+MOONCAKE_DEVICE_NAME="${MOONCAKE_DEVICE_NAME:-}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 
@@ -322,11 +327,16 @@ parallel_args() {
   fi
 }
 
-# The --kv-transfer-config JSON.  The connector name is the only variable part;
-# a single hard-coded string here is what forced editing the file to swap
-# connectors, which made an A/B comparison needlessly error-prone.
+# The --kv-transfer-config JSON.  Built (not hard-coded) so the connector can be
+# swapped without editing the file, and so connector extra config -- the
+# Mooncake RDMA rail in particular -- survives as a single argument.
 kv_transfer_config() {
-  printf '{"kv_connector":"%s","kv_role":"%s"}' "$KV_CONNECTOR" "$1"
+  local role="$1" extra="{}"
+  if [ -n "$MOONCAKE_DEVICE_NAME" ]; then
+    extra="{\"device_name\":\"${MOONCAKE_DEVICE_NAME}\"}"
+  fi
+  printf '{"kv_connector":"%s","kv_role":"%s","kv_connector_extra_config":%s}' \
+    "$KV_CONNECTOR" "$role" "$extra"
 }
 
 # Per-connector service environment.  The two connectors disagree on how the
@@ -364,14 +374,6 @@ connector_env() {
         CONNECTOR_ENV+=(
           "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=${MOONCAKE_ABORT_REQUEST_TIMEOUT}"
         )
-      # Mooncake transfer-engine rail selection (MC_FORCE_HCA).  On a host with
-      # several RoCE rails the engine's topology discovery can pick a different
-      # device per side -- measured here: one side landed on the management bond
-      # (10.8.2.x) and the other on a 100.75.4.x rail, after which every RDMA
-      # write timed out ("transport retry counter exceeded").  Pinning both
-      # sides to the same rail is what makes the data path work.
-      [ -n "$MOONCAKE_FORCE_HCA" ] &&
-        CONNECTOR_ENV+=("MC_FORCE_HCA=${MOONCAKE_FORCE_HCA}")
       ;;
     *)
       # Caught here rather than at launch time: a typo must not start a server
@@ -471,7 +473,7 @@ case "$ROLE" in
     printf 'DECODE_MOONCAKE_BOOTSTRAP_PORT=%s\n' "$DECODE_MOONCAKE_BOOTSTRAP_PORT"
     printf 'WITH_NVIDIA_PEERMEM=%s\n' "$WITH_NVIDIA_PEERMEM"
     printf 'MOONCAKE_ABORT_REQUEST_TIMEOUT=%s\n' "$MOONCAKE_ABORT_REQUEST_TIMEOUT"
-    printf 'MOONCAKE_FORCE_HCA=%s\n' "$MOONCAKE_FORCE_HCA"
+    printf 'MOONCAKE_DEVICE_NAME=%s\n' "$MOONCAKE_DEVICE_NAME"
     printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
     printf 'PREFILL_TP=%s\n' "$PREFILL_TP"
     printf 'DECODE_TP=%s\n' "$DECODE_TP"
