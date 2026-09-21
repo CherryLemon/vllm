@@ -95,9 +95,12 @@ Environment variables (set by ``dsv41_dspark_pd_sm90.sh``):
                               adopted.
     DSV41_DECODE_LOG        - path to the decode instance's stdout/stderr, for
                               the evidence Mooncake only emits as log lines
-                              (transfer stats, bootstrap failures).  Unset
+                              (failed receives, bootstrap failures).  Unset
                               means those checks report "no evidence" instead
                               of passing silently.
+    DSV41_PREFILL_LOG       - the prefill instance's log, which is where
+                              Mooncake records *successful* transfers (the
+                              sender side owns that stat).
     DSV41_ABORT_TIMEOUT_PROBE - 1 enables the final probe that asks whether a
                               request parked on an unreachable producer is ever
                               released (default 0).  Opt-in because it waits.
@@ -142,10 +145,11 @@ IS_NIXL = KV_CONNECTOR.endswith("NixlConnector")
 # Prometheus exporter (the connector carries a TODO for one), so the counters
 # only reach the log as periodic "KV Transfer metrics: ..." lines.
 DECODE_LOG = os.environ.get("DSV41_DECODE_LOG", "")
+# Mooncake records successful transfers on the *producer* (senders) and failed
+# receives on the *consumer*, so both logs are parsed when given.
+PREFILL_LOG = os.environ.get("DSV41_PREFILL_LOG", "")
 ABORT_TIMEOUT_PROBE = os.environ.get("DSV41_ABORT_TIMEOUT_PROBE", "0") == "1"
-ABORT_TIMEOUT_PROBE_WAIT = float(
-    os.environ.get("DSV41_ABORT_TIMEOUT_PROBE_WAIT", "90")
-)
+ABORT_TIMEOUT_PROBE_WAIT = float(os.environ.get("DSV41_ABORT_TIMEOUT_PROBE_WAIT", "90"))
 
 # Mirrors the model's SWA bounded-replay window; see the module docstring.
 SWA_REPLAY_TOKENS = int(os.environ.get("DSV41_SWA_REPLAY_TOKENS", "128"))
@@ -186,8 +190,11 @@ PREFIX_HITS = "vllm:prefix_cache_hits_total"
 # records the number of tokens the connector claimed to have matched
 # externally.  It exists for every cross-instance connector, unlike the
 # per-connector transfer counters below.
-EXTERNAL_QUERIES = "vllm:external_prefix_cache_queries"
-EXTERNAL_HITS = "vllm:external_prefix_cache_hits"
+# prometheus_client appends `_total` to counter names in the exposition, and
+# these two are declared *without* it in loggers.py -- scraping the declared
+# name silently returns 0 for every series.
+EXTERNAL_QUERIES = "vllm:external_prefix_cache_queries_total"
+EXTERNAL_HITS = "vllm:external_prefix_cache_hits_total"
 
 ALL_METRICS = (
     SPEC_DRAFTS,
@@ -218,15 +225,20 @@ TRANSFER_METRICS = (
 _KV_METRICS_RE = re.compile(r"KV Transfer metrics: (.*)")
 
 
-def _decode_log_text() -> str:
-    """The decode instance's log, or "" when no log path was provided."""
-    if not DECODE_LOG:
+def _log_text(path: str) -> str:
+    """One connector log, or "" when unset/unreadable."""
+    if not path:
         return ""
     try:
-        with open(DECODE_LOG, errors="replace") as fh:
+        with open(path, errors="replace") as fh:
             return fh.read()
     except OSError:
         return ""
+
+
+def _decode_log_text() -> str:
+    """Both instance logs the caller provided (decode first)."""
+    return _log_text(DECODE_LOG) + _log_text(PREFILL_LOG)
 
 
 def mooncake_log_stats() -> dict[str, float]:
@@ -303,6 +315,28 @@ def scrape(url: str, names: tuple[str, ...]) -> dict[str, float]:
 
 def delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
     return {k: after.get(k, 0.0) - before.get(k, 0.0) for k in before}
+
+
+def await_metric_move(
+    before: dict[str, float], names: tuple[str, ...], timeout: float = 10.0
+) -> None:
+    """Let the engine's stats tick catch up before sampling the "after" side.
+
+    Engine-side counters are updated by the metrics logger *after* the engine
+    step that produced them, while the HTTP response can already have been
+    returned.  Sampling immediately made the very first round of a fresh
+    instance see a zero delta for a series that had simply not been exported
+    yet (observed with vllm:external_prefix_cache_hits_total: the series did not
+    exist at the first scrape and read 6528 a minute later).
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        now = scrape(DECODE_METRICS_URL, names)
+        if all(now[n] > before.get(n, 0.0) for n in names):
+            return
+        time.sleep(0.5)
+    # Not an error here: the assertions below own the failure message, and a
+    # connector may legitimately record nothing (that is what they test).
 
 
 def _client(base_url: str, max_retries: int | None = None) -> openai.OpenAI:
@@ -453,6 +487,10 @@ def round_metrics(prompts):
     around each request and must not be mixed into this cumulative delta.
     """
     before = scrape(DECODE_METRICS_URL, ALL_METRICS)
+    # Mooncake's counters are log-only; sample them across the round too so a
+    # failure is attributed to *this* round rather than to an earlier one (the
+    # file is meant to be re-runnable against a live instance).
+    log_before = {} if IS_NIXL else mooncake_log_stats()
     outputs: list[str] = []
     prompt_tokens: list[int] = []
     for p in prompts:
@@ -460,11 +498,14 @@ def round_metrics(prompts):
         outputs.append(resp.choices[0].text)
         # Prompt length from a real call: a max_tokens=0 probe is rejected 400.
         prompt_tokens.append(int(resp.usage.prompt_tokens))
+    await_metric_move(before, (EXTERNAL_HITS,))
     after = scrape(DECODE_METRICS_URL, ALL_METRICS)
     return {
         "before": before,
         "after": after,
         "delta": delta(before, after),
+        "log_before": log_before,
+        "log_after": {} if IS_NIXL else mooncake_log_stats(),
         "outputs": outputs,
         "prompt_tokens": prompt_tokens,
     }
@@ -495,9 +536,9 @@ def first_token_ab(prompts):
                 "DSV41_SKIP_NEGATIVE_CONTROL=1 so no such request is created."
             )
         hits_before = scrape(DECODE_METRICS_URL, (PREFIX_QUERIES, PREFIX_HITS))
-        local_first = _complete_resp(DECODE_BASE_URL, prompt, max_tokens=1).choices[
-            0
-        ].text
+        local_first = (
+            _complete_resp(DECODE_BASE_URL, prompt, max_tokens=1).choices[0].text
+        )
         hits_after = scrape(DECODE_METRICS_URL, (PREFIX_QUERIES, PREFIX_HITS))
         local_hits = hits_after[PREFIX_HITS] - hits_before[PREFIX_HITS]
 
@@ -509,6 +550,7 @@ def first_token_ab(prompts):
             )
         before = scrape(DECODE_METRICS_URL, TRANSFER_METRICS)
         pd_first = _complete_resp(PROXY_BASE_URL, prompt, max_tokens=1).choices[0].text
+        await_metric_move(before, (EXTERNAL_HITS,), timeout=5.0)
         after = scrape(DECODE_METRICS_URL, TRANSFER_METRICS)
         pair_delta = delta(before, after)
         pairs.append(
@@ -601,21 +643,31 @@ def test_kv_transfer_is_actually_used(round_metrics):
             "instance (RUN_SALT) and above the replay window."
         )
     else:
-        # Mooncake's counters are log-only; assert on the *whole-run* totals,
-        # which is coarser than the per-request NIXL counters but still a
-        # failure gate rather than no gate at all.
-        stats = mooncake_log_stats()
-        assert stats["failed_transfers"] == 0 and stats["failed_recvs"] == 0, (
+        # Mooncake's counters are log-only.  The stats line is periodic, so a
+        # 4-request round can fall between two ticks: successes are checked
+        # cumulatively (the decode *and* prefill logs are summed, because the
+        # sender side owns that stat) while "this round really transferred"
+        # rests on the external-token delta below.
+        stats = round_metrics["log_after"]
+        grew = {k: stats[k] - round_metrics["log_before"].get(k, 0.0) for k in stats}
+        assert grew["failed_transfers"] == 0 and grew["failed_recvs"] == 0, (
             "Mooncake recorded failed transfers during this round: "
-            f"{stats}. A retry that recovered does not belong in the clean-path "
-            "gate; investigate the link before accepting the run."
+            f"{grew} (cumulative {stats}). A retry that recovered does not "
+            "belong in the clean-path gate; investigate the link before "
+            "accepting the run."
         )
-        assert stats["expired"] == 0, (
-            f"Mooncake expired {stats['expired']:.0f} producer-side transfer(s) "
-            "waiting for the decode side; those blocks were freed without being "
-            "read."
+        assert grew["expired"] == 0, (
+            f"Mooncake expired {grew['expired']:.0f} producer-side transfer(s) "
+            "during this round; those blocks were freed without being read."
         )
         transfer_evidence = stats["successful"]
+        assert transfer_evidence > 0, (
+            "no successful Mooncake transfer appears in either instance log "
+            f"(decode log: {bool(DECODE_LOG)}, prefill log: {bool(PREFILL_LOG)}). "
+            "The producer logs 'Num successful transfers' once it has sent; a "
+            "zero means the send path never ran -- check that the router gave "
+            "the prefiller a transfer_id."
+        )
 
     # Connector-agnostic: the scheduler only records these for tokens the
     # connector actually supplied, so a zero here means the decode instance
@@ -651,9 +703,7 @@ def test_pd_first_token_matches_local_prefill(first_token_ab):
     """
     assert first_token_ab, "no prompt pairs were measured"
     if COLD_RESET:
-        polluted = [
-            p for p in first_token_ab if p["local_prefix_hits"] > 0
-        ]
+        polluted = [p for p in first_token_ab if p["local_prefix_hits"] > 0]
         assert not polluted, (
             "the local control leg hit the decode instance's prefix cache for "
             f"{len(polluted)}/{len(first_token_ab)} prompts despite a reset "
@@ -696,8 +746,7 @@ def test_pd_first_token_matches_local_prefill(first_token_ab):
         "token cannot be evidence about disaggregation (it came from a local "
         "prefill or from the local prefix cache):\n"
         + "\n".join(
-            f"  {p['prompt'][:50]!r} "
-            f"external_tokens={p['pd_external_tokens']:.0f}"
+            f"  {p['prompt'][:50]!r} external_tokens={p['pd_external_tokens']:.0f}"
             for p in no_external
         )
     )
@@ -1021,5 +1070,3 @@ def test_parked_remote_kv_request_is_released():
             "instance needs a restart before its prefix cache can be reset, so "
             "abort/reset is connector-independent."
         )
-
-
