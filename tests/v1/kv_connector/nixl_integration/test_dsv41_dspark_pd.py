@@ -83,11 +83,32 @@ Environment variables (set by ``dsv41_dspark_pd_sm90.sh``):
                               cannot abort, which blocks prefix-cache resets
                               until the decode instance is restarted; the A/B
                               must run before it (test order) for that reason.
+    DSV41_KV_CONNECTOR      - connector under test (default NixlConnector).
+                              Only the *evidence* differs between connectors,
+                              so the same acceptance criteria run against
+                              MooncakeConnector: NIXL exports per-transfer
+                              Prometheus counters, Mooncake does not (its
+                              stats are periodic log lines), and both are
+                              bracketed by the connector-agnostic
+                              ``vllm:external_prefix_cache_hits`` counter,
+                              which is what actually proves remote KV was
+                              adopted.
+    DSV41_DECODE_LOG        - path to the decode instance's stdout/stderr, for
+                              the evidence Mooncake only emits as log lines
+                              (transfer stats, bootstrap failures).  Unset
+                              means those checks report "no evidence" instead
+                              of passing silently.
+    DSV41_ABORT_TIMEOUT_PROBE - 1 enables the final probe that asks whether a
+                              request parked on an unreachable producer is ever
+                              released (default 0).  Opt-in because it waits.
+    DSV41_ABORT_TIMEOUT_PROBE_WAIT - seconds to wait for that release
+                              (default 90)
 """
 
 import contextlib
 import json
 import os
+import re
 import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -112,6 +133,19 @@ COLD_RESET = os.environ.get("DSV41_COLD_RESET", "1") == "1"
 # engine cannot abort (see the test's docstring).  Skip it when re-running only
 # the A/B against an instance that already has one parked.
 SKIP_NEGATIVE_CONTROL = os.environ.get("DSV41_SKIP_NEGATIVE_CONTROL", "0") == "1"
+
+# Connector under test.  The acceptance criteria are the same for every
+# cross-instance connector; what differs is where the transfer evidence lives.
+KV_CONNECTOR = os.environ.get("DSV41_KV_CONNECTOR", "NixlConnector")
+IS_NIXL = KV_CONNECTOR.endswith("NixlConnector")
+# Mooncake records its transfer stats in KVConnectorStats, which has no
+# Prometheus exporter (the connector carries a TODO for one), so the counters
+# only reach the log as periodic "KV Transfer metrics: ..." lines.
+DECODE_LOG = os.environ.get("DSV41_DECODE_LOG", "")
+ABORT_TIMEOUT_PROBE = os.environ.get("DSV41_ABORT_TIMEOUT_PROBE", "0") == "1"
+ABORT_TIMEOUT_PROBE_WAIT = float(
+    os.environ.get("DSV41_ABORT_TIMEOUT_PROBE_WAIT", "90")
+)
 
 # Mirrors the model's SWA bounded-replay window; see the module docstring.
 SWA_REPLAY_TOKENS = int(os.environ.get("DSV41_SWA_REPLAY_TOKENS", "128"))
@@ -148,6 +182,12 @@ NIXL_EXPIRED = "vllm:nixl_num_kv_expired_reqs_total"
 # Local prefix-cache evidence: the control leg must show a *zero* hit delta.
 PREFIX_QUERIES = "vllm:prefix_cache_queries_total"
 PREFIX_HITS = "vllm:prefix_cache_hits_total"
+# Connector-agnostic evidence that remote KV was *adopted*: the scheduler
+# records the number of tokens the connector claimed to have matched
+# externally.  It exists for every cross-instance connector, unlike the
+# per-connector transfer counters below.
+EXTERNAL_QUERIES = "vllm:external_prefix_cache_queries"
+EXTERNAL_HITS = "vllm:external_prefix_cache_hits"
 
 ALL_METRICS = (
     SPEC_DRAFTS,
@@ -158,6 +198,8 @@ ALL_METRICS = (
     NIXL_FAILED_XFER,
     NIXL_FAILED_NOTIFY,
     NIXL_EXPIRED,
+    EXTERNAL_QUERIES,
+    EXTERNAL_HITS,
 )
 
 TRANSFER_METRICS = (
@@ -167,7 +209,72 @@ TRANSFER_METRICS = (
     NIXL_FAILED_NOTIFY,
     PREFIX_QUERIES,
     PREFIX_HITS,
+    EXTERNAL_QUERIES,
+    EXTERNAL_HITS,
 )
+
+# Mooncake's periodic stats line, e.g.
+#   KV Transfer metrics: Num successful transfers=4, Avg xfer time (ms)=1.2, ...
+_KV_METRICS_RE = re.compile(r"KV Transfer metrics: (.*)")
+
+
+def _decode_log_text() -> str:
+    """The decode instance's log, or "" when no log path was provided."""
+    if not DECODE_LOG:
+        return ""
+    try:
+        with open(DECODE_LOG, errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def mooncake_log_stats() -> dict[str, float]:
+    """Sum the Mooncake counters that only exist in the log.
+
+    Returned keys are connector vocabulary, not Prometheus names: the stats
+    module renders "Num successful transfers", "Num failed recvs", etc.
+    """
+    totals = {
+        "successful": 0.0,
+        "failed_transfers": 0.0,
+        "failed_recvs": 0.0,
+        "expired": 0.0,
+    }
+    for line in _KV_METRICS_RE.findall(_decode_log_text()):
+        for item in line.split(","):
+            key, _, value = item.partition("=")
+            key = key.strip().lower()
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            if key.startswith("num successful"):
+                totals["successful"] += number
+            elif key.startswith("num failed transfers"):
+                totals["failed_transfers"] += number
+            elif key.startswith("num failed recvs"):
+                totals["failed_recvs"] += number
+            elif key.startswith("num kv expired"):
+                totals["expired"] += number
+    return totals
+
+
+def mooncake_pull_failure_seen(addr: str) -> bool:
+    """True when the decode log shows a failed remote-KV pull from *addr*.
+
+    That is connector-level evidence the request reached the pull path: the
+    consumer queried the producer's bootstrap server and gave up.  Used
+    because a *bootstrap* failure (unlike a mid-transfer failure) has no
+    counter of its own.
+    """
+    text = _decode_log_text()
+    if not text or addr not in text:
+        return False
+    return (
+        f"Failed to connect to bootstrap server http://{addr}" in text
+        or "not found from bootstrap server" in text
+    )
 
 
 def scrape(url: str, names: tuple[str, ...]) -> dict[str, float]:
@@ -235,7 +342,8 @@ def _complete_resp(
 def _complete(
     prompt: str, max_tokens: int = MAX_TOKENS, extra_body: dict | None = None
 ) -> str:
-    return _complete_resp(PROXY_BASE_URL, prompt, max_tokens, extra_body).choices[0].text
+    result = _complete_resp(PROXY_BASE_URL, prompt, max_tokens, extra_body)
+    return result.choices[0].text
 
 
 def reset_decode_prefix_cache() -> bool:
@@ -409,10 +517,17 @@ def first_token_ab(prompts):
                 "pd": pd_first,
                 "local": local_first,
                 "local_prefix_hits": local_hits,
-                "pd_transfer": pair_delta[NIXL_XFER_COUNT]
-                + pair_delta[NIXL_POST_COUNT],
-                "pd_failed": pair_delta[NIXL_FAILED_XFER]
-                + pair_delta[NIXL_FAILED_NOTIFY],
+                "pd_transfer": (
+                    pair_delta[NIXL_XFER_COUNT] + pair_delta[NIXL_POST_COUNT]
+                    if IS_NIXL
+                    else 0.0
+                ),
+                "pd_external_tokens": pair_delta[EXTERNAL_HITS],
+                "pd_failed": (
+                    pair_delta[NIXL_FAILED_XFER] + pair_delta[NIXL_FAILED_NOTIFY]
+                    if IS_NIXL
+                    else 0.0
+                ),
             }
         )
     return pairs
@@ -473,19 +588,50 @@ def test_kv_transfer_is_actually_used(round_metrics):
         "the filler in PROMPTS (or lower DSV41_SWA_REPLAY_TOKENS if the model "
         "changed)."
     )
-    for name in (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY, NIXL_EXPIRED):
-        assert d[name] == 0, f"{name} moved by {d[name]} during the round"
+    if IS_NIXL:
+        for name in (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY, NIXL_EXPIRED):
+            assert d[name] == 0, f"{name} moved by {d[name]} during the round"
+        transfer_evidence = d[NIXL_XFER_COUNT] + d[NIXL_POST_COUNT]
+        assert transfer_evidence > 0, (
+            "no KV transfer was recorded during this round "
+            f"({NIXL_XFER_COUNT} delta={d[NIXL_XFER_COUNT]}, "
+            f"{NIXL_POST_COUNT} delta={d[NIXL_POST_COUNT]}). The decode instance "
+            "answered from a local prefill, so this run does not exercise "
+            "disaggregation at all -- check the prompts are novel to the decode "
+            "instance (RUN_SALT) and above the replay window."
+        )
+    else:
+        # Mooncake's counters are log-only; assert on the *whole-run* totals,
+        # which is coarser than the per-request NIXL counters but still a
+        # failure gate rather than no gate at all.
+        stats = mooncake_log_stats()
+        assert stats["failed_transfers"] == 0 and stats["failed_recvs"] == 0, (
+            "Mooncake recorded failed transfers during this round: "
+            f"{stats}. A retry that recovered does not belong in the clean-path "
+            "gate; investigate the link before accepting the run."
+        )
+        assert stats["expired"] == 0, (
+            f"Mooncake expired {stats['expired']:.0f} producer-side transfer(s) "
+            "waiting for the decode side; those blocks were freed without being "
+            "read."
+        )
+        transfer_evidence = stats["successful"]
 
-    transfer_evidence = d[NIXL_XFER_COUNT] + d[NIXL_POST_COUNT]
-    assert transfer_evidence > 0, (
-        "no KV transfer was recorded during this round "
-        f"({NIXL_XFER_COUNT} delta={d[NIXL_XFER_COUNT]}, "
-        f"{NIXL_POST_COUNT} delta={d[NIXL_POST_COUNT]}). The decode instance "
-        "answered from a local prefill, so this run does not exercise "
-        "disaggregation at all -- check the prompts are novel to the decode "
-        "instance (RUN_SALT) and above the replay window."
+    # Connector-agnostic: the scheduler only records these for tokens the
+    # connector actually supplied, so a zero here means the decode instance
+    # recomputed locally and disaggregation was not exercised.
+    external = d[EXTERNAL_HITS]
+    assert external > 0, (
+        f"{EXTERNAL_HITS} delta is 0: the decode instance adopted no remotely "
+        f"computed tokens this round (queries delta {d[EXTERNAL_QUERIES]:.0f}). "
+        "Text alone cannot catch this -- a local prefill produces the same "
+        "answer -- so the connector either never matched the prompt or the "
+        "external hit was dropped (SWA replay window, block rounding)."
     )
-    print(f"\nKV transfer this round: {transfer_evidence:.0f} transfer(s)")
+    print(
+        f"\nKV transfer this round: {transfer_evidence:.0f} transfer(s), "
+        f"{external:.0f} externally matched token(s) adopted by the decoder"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -520,22 +666,39 @@ def test_pd_first_token_matches_local_prefill(first_token_ab):
     failed_transfers = [p for p in first_token_ab if p["pd_failed"] > 0]
     assert not failed_transfers, (
         f"{len(failed_transfers)}/{len(first_token_ab)} compared PD requests "
-        "recorded a *failed* NIXL transfer while still answering. This gate is "
-        "for the clean path: a retry that recovered the transfer must not be "
-        "accepted here (test fault tolerance separately).\n"
+        f"recorded a *failed* {KV_CONNECTOR} transfer while still answering. "
+        "This gate is for the clean path: a retry that recovered the transfer "
+        "must not be accepted here (test fault tolerance separately).\n"
         + "\n".join(
             f"  {p['prompt'][:50]!r} failures={p['pd_failed']:.0f}"
             for p in failed_transfers
         )
     )
-    no_transfer = [p for p in first_token_ab if p["pd_transfer"] <= 0]
-    assert not no_transfer, (
-        f"{len(no_transfer)}/{len(first_token_ab)} compared PD requests recorded "
-        "no KV transfer of their own, so their first token cannot be evidence "
-        "about disaggregation (it came from a local prefill or a cache hit):\n"
+    # Per-request transfer counters are NIXL-only.  For a connector without
+    # them the equivalent per-request gate is the external-token count below,
+    # which the scheduler keeps for every connector.
+    if IS_NIXL:
+        no_transfer = [p for p in first_token_ab if p["pd_transfer"] <= 0]
+        assert not no_transfer, (
+            f"{len(no_transfer)}/{len(first_token_ab)} compared PD requests "
+            "recorded no KV transfer of their own, so their first token cannot "
+            "be evidence about disaggregation (it came from a local prefill or "
+            "a cache hit):\n"
+            + "\n".join(
+                f"  {p['prompt'][:50]!r} transfer_delta={p['pd_transfer']:.0f}"
+                for p in no_transfer
+            )
+        )
+    no_external = [p for p in first_token_ab if p["pd_external_tokens"] <= 0]
+    assert not no_external, (
+        f"{len(no_external)}/{len(first_token_ab)} compared PD requests adopted "
+        f"no externally computed tokens ({EXTERNAL_HITS} delta 0), so their first "
+        "token cannot be evidence about disaggregation (it came from a local "
+        "prefill or from the local prefix cache):\n"
         + "\n".join(
-            f"  {p['prompt'][:50]!r} transfer_delta={p['pd_transfer']:.0f}"
-            for p in no_transfer
+            f"  {p['prompt'][:50]!r} "
+            f"external_tokens={p['pd_external_tokens']:.0f}"
+            for p in no_external
         )
     )
 
@@ -553,13 +716,22 @@ def test_pd_first_token_matches_local_prefill(first_token_ab):
     )
     print(
         f"\nfirst-token A/B this round: {len(first_token_ab) - len(mismatches)}"
-        f"/{len(first_token_ab)} identical; PD transfers per compared request: "
-        + ", ".join(f"{p['pd_transfer']:.0f}" for p in first_token_ab)
+        f"/{len(first_token_ab)} identical; per compared request: "
+        + ", ".join(
+            (
+                f"{p['pd_transfer']:.0f} transfer(s)"
+                if IS_NIXL
+                else f"{p['pd_external_tokens']:.0f} external tokens"
+            )
+            for p in first_token_ab
+        )
     )
 
 
 def test_pd_outputs_are_non_degenerate(round_metrics):
-    assert any(t.strip() for t in round_metrics["outputs"]), "every completion was empty"
+    assert any(t.strip() for t in round_metrics["outputs"]), (
+        "every completion was empty"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -654,9 +826,10 @@ def test_negative_control_unreachable_producer(round_metrics):
 
     And the non-answer must be *connector-level*: a rejected request (HTTP
     400) or an unreachable decode service proves nothing, so both fail here.
-    A non-answer is accepted only with evidence -- a moved NIXL failure
-    counter, or a request parked for at least 30 s -- and the decode instance
-    must still be healthy and still schedule afterwards.
+    A non-answer is accepted only with evidence -- a moved transfer failure
+    counter (per connector: NIXL's Prometheus series or Mooncake's log lines),
+    a logged bootstrap failure, or a request parked for at least 30 s -- and
+    the decode instance must still be healthy and still schedule afterwards.
 
     Known vLLM limitation: the parked request cannot be aborted while it waits
     for a remote transfer, so it keeps the decode instance's blocks referenced
@@ -684,9 +857,19 @@ def test_negative_control_unreachable_producer(round_metrics):
         "pp_size": 1,
         "transfer_mode": "pull",
     }
+    if not IS_NIXL:
+        # MooncakeConnector silently falls back to a *local* prefill when these
+        # three keys are missing ("This request will not utilize KVTransfer"),
+        # so a NIXL-shaped dict would be answered locally and the control would
+        # pass for the wrong reason.
+        bogus |= {
+            "transfer_id": "cmpl-negative-control",
+            "remote_bootstrap_addr": "http://10.255.255.1:8998",
+        }
     # Sample the failure counters across the negative control only, so a
     # "transfer failed" claim cannot be inherited from an unrelated step.
     before = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
+    before_log = mooncake_log_stats() if not IS_NIXL else {}
     started = time.time()
     answered = None
     failure: Exception | None = None
@@ -736,22 +919,41 @@ def test_negative_control_unreachable_producer(round_metrics):
 
     after = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
     failed = delta(before, after)
-    failure_evidence = failed[NIXL_FAILED_XFER] + failed[NIXL_FAILED_NOTIFY]
+    if IS_NIXL:
+        failure_evidence = failed[NIXL_FAILED_XFER] + failed[NIXL_FAILED_NOTIFY]
+        connector_failure = ""
+    else:
+        after_log = mooncake_log_stats()
+        log_delta = {k: after_log[k] - before_log.get(k, 0.0) for k in after_log}
+        failure_evidence = log_delta["failed_recvs"] + log_delta["failed_transfers"]
+        # A bootstrap connection failure is reported as a failed recv (the
+        # connector hands the request back to the scheduler) and logged, but a
+        # refused *connection* may only show up in the log, so accept either.
+        bootstrap_failed = mooncake_pull_failure_seen("10.255.255.1")
+        failure_evidence += 1.0 if bootstrap_failed else 0.0
+        connector_failure = (
+            f", bootstrap pull log evidence: {bootstrap_failed}"
+            f", failed recvs +{log_delta['failed_recvs']:.0f}"
+            f", failed transfers +{log_delta['failed_transfers']:.0f}"
+        )
     still_pulling = connector_reports_pending_remote_kv()
     print(
         f"negative control: no answer after {elapsed:.1f}s "
         f"({type(failure).__name__ if failure else 'no exception'}), "
         f"transfer failures +{failure_evidence:.0f}, "
         f"engine still reports a pending remote KV wait: {still_pulling}"
+        f"{connector_failure}"
     )
     assert failure_evidence > 0 or still_pulling, (
         "the negative control did not answer, but there is no connector-level "
         "evidence that it reached the pull path: the failure counters stayed "
-        "flat and the engine does not report a request waiting for remote KV. "
-        "A plain queueing delay (or a silently dropped request) satisfies "
-        '"it did not answer" without proving anything about remote prefill.\n'
+        "flat, the log shows no failed bootstrap pull, and the engine does not "
+        "report a request waiting for remote KV. A plain queueing delay (or a "
+        'silently dropped request) satisfies "it did not answer" without '
+        "proving anything about remote prefill.\n"
         f"  exception: {type(failure).__name__ if failure else 'none'}, "
-        f"elapsed {elapsed:.1f}s, failures +{failure_evidence:.0f}"
+        f"elapsed {elapsed:.1f}s, failures +{failure_evidence:.0f}, "
+        f"decode log provided: {bool(DECODE_LOG)}"
     )
     assert decode_is_healthy(), (
         "the decode instance stopped serving after the negative control; the "
@@ -765,5 +967,59 @@ def test_negative_control_unreachable_producer(round_metrics):
         max_tokens=1,
     )
     assert probe.choices, "the decode instance scheduled nothing after the control"
+
+
+# ---------------------------------------------------------------------------
+# 2c. is a parked remote-KV request ever released? (opt-in, LAST)
+# ---------------------------------------------------------------------------
+
+
+def test_parked_remote_kv_request_is_released():
+    """Does the connector release the request the negative control parked?
+
+    This is the round-4 open item, made measurable.  On NixlConnector the
+    request stayed parked until the engine restarted: the blocks stayed
+    referenced, so ``/reset_prefix_cache`` kept answering 500 ("requests
+    waiting for remote KV transfer, which is not supported yet") and the only
+    recovery documented in this file was a restart.  The question is whether
+    the connector's own failure path hands the request back to the scheduler.
+
+    Opt-in (``DSV41_ABORT_TIMEOUT_PROBE=1``) because it waits, and because it
+    is only meaningful after the negative control created the parked request.
+    """
+    if not ABORT_TIMEOUT_PROBE:
+        pytest.skip("DSV41_ABORT_TIMEOUT_PROBE is not set")
+    if SKIP_NEGATIVE_CONTROL:
+        pytest.skip("no parked request: DSV41_SKIP_NEGATIVE_CONTROL=1")
+
+    deadline = time.time() + ABORT_TIMEOUT_PROBE_WAIT
+    released = False
+    while time.time() < deadline:
+        if reset_decode_prefix_cache():
+            released = True
+            break
+        time.sleep(5)
+    elapsed = ABORT_TIMEOUT_PROBE_WAIT - max(deadline - time.time(), 0.0)
+    print(
+        f"\nparked-request release probe ({KV_CONNECTOR}): "
+        f"reset_prefix_cache succeeded={released} after <= {elapsed:.1f}s "
+        f"(waited up to {ABORT_TIMEOUT_PROBE_WAIT:.0f}s)"
+    )
+    if IS_NIXL:
+        # Known, reported limitation: NIXL leaves the request parked.  Recorded
+        # rather than asserted, so an upstream fix does not turn a real
+        # improvement into a test failure.
+        if released:
+            print(
+                "NOTE: NixlConnector released the parked request -- the known "
+                "limitation documented in this file no longer holds, update it."
+            )
+    else:
+        assert released, (
+            f"the parked request was still not released after "
+            f"{ABORT_TIMEOUT_PROBE_WAIT:.0f}s with {KV_CONNECTOR}; the decode "
+            "instance needs a restart before its prefix cache can be reset, so "
+            "abort/reset is connector-independent."
+        )
 
 

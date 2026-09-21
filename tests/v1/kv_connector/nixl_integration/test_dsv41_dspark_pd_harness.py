@@ -36,6 +36,17 @@ def harness_config(**env_overrides: str) -> dict[str, str]:
     env.pop("DECODE_HOST", None)
     env.pop("ENABLE_GRAPHS", None)
     env.pop("BUCKETS", None)
+    # Connector selection must come from the test, not from the caller's shell:
+    # a leaked KV_CONNECTOR would silently turn the "default" tests into
+    # Mooncake tests.
+    for leaked in (
+        "KV_CONNECTOR",
+        "WITH_NVIDIA_PEERMEM",
+        "MOONCAKE_ABORT_REQUEST_TIMEOUT",
+        "PREFILL_MOONCAKE_BOOTSTRAP_PORT",
+        "DECODE_MOONCAKE_BOOTSTRAP_PORT",
+    ):
+        env.pop(leaked, None)
     env.update(env_overrides)
     env["ROLE"] = "print-config"
     proc = subprocess.run(
@@ -77,6 +88,77 @@ def test_json_override_is_not_mangled():
     spec = '{"method":"dspark","num_speculative_tokens":10}'
     cfg = harness_config(DECODE_SPEC_CONFIG=spec)
     assert cfg["DECODE_SPEC_CONFIG"] == spec
+
+
+def test_connector_defaults_to_nixl_and_gets_the_side_channel_env():
+    """NIXL is the default; its two env vars must still reach both commands."""
+    cfg = harness_config(NIXL_SIDE_CHANNEL_HOST="10.8.2.13")
+    assert cfg["KV_CONNECTOR"] == "NixlConnector"
+    p_args = args_of(cfg, "PREFILL_CMD")
+    d_args = args_of(cfg, "DECODE_CMD")
+    assert "VLLM_NIXL_SIDE_CHANNEL_HOST=10.8.2.13" in p_args
+    assert "VLLM_NIXL_SIDE_CHANNEL_PORT=5600" in p_args
+    assert "VLLM_NIXL_SIDE_CHANNEL_PORT=5610" in d_args
+    assert json.loads(p_args[p_args.index("--kv-transfer-config") + 1]) == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_producer",
+    }
+    assert (
+        json.loads(d_args[d_args.index("--kv-transfer-config") + 1])["kv_role"]
+        == "kv_consumer"
+    )
+    # Mooncake-only knobs must not leak into a NIXL launch.
+    assert not any(a.startswith("VLLM_MOONCAKE") for a in p_args + d_args)
+
+
+def test_mooncake_connector_swaps_the_json_and_the_env():
+    """The whole point of the switch: same harness, different connector."""
+    cfg = harness_config(
+        KV_CONNECTOR="MooncakeConnector",
+        WITH_NVIDIA_PEERMEM="0",
+        MOONCAKE_ABORT_REQUEST_TIMEOUT="60",
+        NIXL_SIDE_CHANNEL_HOST="10.8.2.13",
+    )
+    p_args = args_of(cfg, "PREFILL_CMD")
+    d_args = args_of(cfg, "DECODE_CMD")
+    assert json.loads(p_args[p_args.index("--kv-transfer-config") + 1]) == {
+        "kv_connector": "MooncakeConnector",
+        "kv_role": "kv_producer",
+    }
+    assert (
+        json.loads(d_args[d_args.index("--kv-transfer-config") + 1])["kv_role"]
+        == "kv_consumer"
+    )
+    # One bootstrap server per instance: a shared port would collide when the
+    # two instances run on one host (ROLE=all).
+    assert "VLLM_MOONCAKE_BOOTSTRAP_PORT=8998" in p_args
+    assert "VLLM_MOONCAKE_BOOTSTRAP_PORT=8999" in d_args
+    assert "WITH_NVIDIA_PEERMEM=0" in p_args and "WITH_NVIDIA_PEERMEM=0" in d_args
+    assert "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=60" in p_args
+    assert "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=60" in d_args
+    assert not any(a.startswith("VLLM_NIXL") for a in p_args + d_args)
+
+
+def test_optional_connector_knobs_are_omitted_when_unset():
+    """Passing an empty value would override the library default with ""."""
+    cfg = harness_config(KV_CONNECTOR="MooncakeConnector")
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        args = args_of(cfg, key)
+        assert not any(a.startswith("WITH_NVIDIA_PEERMEM") for a in args)
+        assert not any(
+            a.startswith("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT") for a in args
+        )
+
+
+def test_unknown_connector_fails_instead_of_starting_a_mismatched_pair():
+    env = dict(os.environ)
+    env["ROLE"] = "print-config"
+    env["KV_CONNECTOR"] = "NotAConnector"
+    proc = subprocess.run(
+        ["bash", str(HARNESS)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "unknown KV_CONNECTOR" in proc.stderr
 
 
 def test_graphs_off_means_eager():

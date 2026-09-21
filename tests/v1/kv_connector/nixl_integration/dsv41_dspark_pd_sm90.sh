@@ -51,6 +51,20 @@
 #   DECODE_PORT         - (default 8300)
 #   PROXY_PORT          - (default 8192)
 #   NIXL_SIDE_CHANNEL_HOST - address the NIXL side channel binds to
+#   KV_CONNECTOR        - NixlConnector (default) or MooncakeConnector.  Both
+#                         implement the same kv_role/do_remote_* protocol and
+#                         carry KV over their own side channel, so the toy proxy
+#                         is unchanged: it only forwards kv_transfer_params.
+#                         MooncakeConnector additionally starts a bootstrap HTTP
+#                         server per instance, so the two roles use different
+#                         ports (8998 / 8999) to stay safe when co-located.
+#   WITH_NVIDIA_PEERMEM - forwarded to the connector when set ("" = library
+#                         default).  Set 0 on a host without the nvidia-peermem
+#                         module so Mooncake uses its DMA-BUF path instead of
+#                         failing to register memory.
+#   MOONCAKE_ABORT_REQUEST_TIMEOUT - forwarded when set; how long the producer
+#                         keeps blocks for an unsent transfer before freeing
+#                         them (connector default 480 s)
 #   PREFILL_HOSTS / DECODE_HOSTS - comma-separated host list for the proxy
 #   PROXY_HOST          - host the proxy listens on (default 127.0.0.1)
 #   DECODE_HOST         - host the *test* reads decode /metrics from
@@ -94,6 +108,17 @@ PROXY_PORT="${PROXY_PORT:-8192}"
 PREFILL_SIDE_CHANNEL_PORT="${PREFILL_SIDE_CHANNEL_PORT:-5600}"
 DECODE_SIDE_CHANNEL_PORT="${DECODE_SIDE_CHANNEL_PORT:-5610}"
 NIXL_SIDE_CHANNEL_HOST="${NIXL_SIDE_CHANNEL_HOST:-127.0.0.1}"
+# KV connector under test.  The harness is otherwise connector-agnostic: roles,
+# speculative config and the proxy protocol are identical.
+KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
+# Mooncake's bootstrap HTTP server binds a port per *instance*; two instances on
+# one host (ROLE=all) would collide on the library default 8998.
+PREFILL_MOONCAKE_BOOTSTRAP_PORT="${PREFILL_MOONCAKE_BOOTSTRAP_PORT:-8998}"
+DECODE_MOONCAKE_BOOTSTRAP_PORT="${DECODE_MOONCAKE_BOOTSTRAP_PORT:-8999}"
+# Empty means "do not pass it": a host with nvidia-peermem loaded should keep
+# the transfer engine's default (peermem on).
+WITH_NVIDIA_PEERMEM="${WITH_NVIDIA_PEERMEM:-}"
+MOONCAKE_ABORT_REQUEST_TIMEOUT="${MOONCAKE_ABORT_REQUEST_TIMEOUT:-}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 
@@ -290,36 +315,89 @@ parallel_args() {
   fi
 }
 
+# The --kv-transfer-config JSON.  The connector name is the only variable part;
+# a single hard-coded string here is what forced editing the file to swap
+# connectors, which made an A/B comparison needlessly error-prone.
+kv_transfer_config() {
+  printf '{"kv_connector":"%s","kv_role":"%s"}' "$KV_CONNECTOR" "$1"
+}
+
+# Per-connector service environment.  The two connectors disagree on how the
+# side channel is addressed: NIXL takes host + port, Mooncake only a bootstrap
+# port (the host is resolved from the local address the peers can reach).
+# CONNECTOR_ENV is filled by connector_env() and expanded into the `env` argv.
+CONNECTOR_ENV=()
+connector_env() {
+  local role="$1"
+  CONNECTOR_ENV=()
+  case "$KV_CONNECTOR" in
+    NixlConnector)
+      CONNECTOR_ENV+=("VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}")
+      if [ "$role" = prefill ]; then
+        CONNECTOR_ENV+=("VLLM_NIXL_SIDE_CHANNEL_PORT=${PREFILL_SIDE_CHANNEL_PORT}")
+      else
+        CONNECTOR_ENV+=("VLLM_NIXL_SIDE_CHANNEL_PORT=${DECODE_SIDE_CHANNEL_PORT}")
+      fi
+      ;;
+    MooncakeConnector)
+      if [ "$role" = prefill ]; then
+        CONNECTOR_ENV+=(
+          "VLLM_MOONCAKE_BOOTSTRAP_PORT=${PREFILL_MOONCAKE_BOOTSTRAP_PORT}"
+        )
+      else
+        CONNECTOR_ENV+=(
+          "VLLM_MOONCAKE_BOOTSTRAP_PORT=${DECODE_MOONCAKE_BOOTSTRAP_PORT}"
+        )
+      fi
+      # Optional knobs: passing an empty value would override the library
+      # default with "", so they are only forwarded when set.
+      [ -n "$WITH_NVIDIA_PEERMEM" ] &&
+        CONNECTOR_ENV+=("WITH_NVIDIA_PEERMEM=${WITH_NVIDIA_PEERMEM}")
+      [ -n "$MOONCAKE_ABORT_REQUEST_TIMEOUT" ] &&
+        CONNECTOR_ENV+=(
+          "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=${MOONCAKE_ABORT_REQUEST_TIMEOUT}"
+        )
+      ;;
+    *)
+      # Caught here rather than at launch time: a typo must not start a server
+      # that silently disagrees with the other side about the connector.
+      log "FAIL: unknown KV_CONNECTOR=${KV_CONNECTOR} (NixlConnector|MooncakeConnector)"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 prefill_cmd() {
   common_args
   parallel_args "$PREFILL_TP" "$PREFILL_DP"
+  connector_env prefill
   CMD=(
     env
-    "VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}"
-    "VLLM_NIXL_SIDE_CHANNEL_PORT=${PREFILL_SIDE_CHANNEL_PORT}"
+    "${CONNECTOR_ENV[@]}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
     "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}"
     --port "$PREFILL_PORT"
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
+    --kv-transfer-config "$(kv_transfer_config kv_producer)"
     --speculative-config "$PREFILL_SPEC_CONFIG"
   )
-  log "prefill instance on port ${PREFILL_PORT} (TP=$PREFILL_TP DP=$PREFILL_DP graphs=$ENABLE_GRAPHS)"
+  log "prefill instance on port ${PREFILL_PORT} (TP=$PREFILL_TP DP=$PREFILL_DP graphs=$ENABLE_GRAPHS connector=$KV_CONNECTOR)"
 }
 
 decode_cmd() {
   common_args
   parallel_args "$DECODE_TP" "$DECODE_DP"
+  connector_env decode
   CMD=(
     env
-    "VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}"
-    "VLLM_NIXL_SIDE_CHANNEL_PORT=${DECODE_SIDE_CHANNEL_PORT}"
+    "${CONNECTOR_ENV[@]}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
     "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}"
     --port "$DECODE_PORT"
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+    --kv-transfer-config "$(kv_transfer_config kv_consumer)"
     --speculative-config "$DECODE_SPEC_CONFIG"
   )
-  log "decode instance on port ${DECODE_PORT} (TP=$DECODE_TP DP=$DECODE_DP graphs=$ENABLE_GRAPHS)"
+  log "decode instance on port ${DECODE_PORT} (TP=$DECODE_TP DP=$DECODE_DP graphs=$ENABLE_GRAPHS connector=$KV_CONNECTOR)"
 }
 
 proxy_cmd() {
@@ -351,6 +429,9 @@ run_test() {
   TEST_MODEL="$SERVED_NAME" \
   DSV41_DSPARK_REFERENCE="${DSV41_DSPARK_REFERENCE:-}" \
   DSV41_STRICT_REFERENCE="${DSV41_STRICT_REFERENCE:-0}" \
+  DSV41_KV_CONNECTOR="$KV_CONNECTOR" \
+  DSV41_DECODE_LOG="${DSV41_DECODE_LOG:-}" \
+  DSV41_ABORT_TIMEOUT_PROBE="${DSV41_ABORT_TIMEOUT_PROBE:-0}" \
   "$PYTHON_BIN" -m pytest -s -x "${SCRIPT_DIR}/test_dsv41_dspark_pd.py"
 }
 
@@ -368,6 +449,11 @@ case "$ROLE" in
     printf 'PREFILL_SPEC_CONFIG=%s\n' "$PREFILL_SPEC_CONFIG"
     printf 'DECODE_SPEC_CONFIG=%s\n' "$DECODE_SPEC_CONFIG"
     printf 'DECODE_HOST=%s\n' "$DECODE_HOST"
+    printf 'KV_CONNECTOR=%s\n' "$KV_CONNECTOR"
+    printf 'PREFILL_MOONCAKE_BOOTSTRAP_PORT=%s\n' "$PREFILL_MOONCAKE_BOOTSTRAP_PORT"
+    printf 'DECODE_MOONCAKE_BOOTSTRAP_PORT=%s\n' "$DECODE_MOONCAKE_BOOTSTRAP_PORT"
+    printf 'WITH_NVIDIA_PEERMEM=%s\n' "$WITH_NVIDIA_PEERMEM"
+    printf 'MOONCAKE_ABORT_REQUEST_TIMEOUT=%s\n' "$MOONCAKE_ABORT_REQUEST_TIMEOUT"
     printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
     printf 'PREFILL_TP=%s\n' "$PREFILL_TP"
     printf 'DECODE_TP=%s\n' "$DECODE_TP"

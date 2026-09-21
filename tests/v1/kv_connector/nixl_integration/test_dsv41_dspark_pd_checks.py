@@ -27,12 +27,19 @@ GATE_FAILURE = (AssertionError, pytest.fail.Exception)
 
 
 def _pair(prompt: str, pd: str, local: str | None = None, transfer: float = 1.0):
+    """One measured A/B pair, as ``first_token_ab`` builds it.
+
+    ``pd_external_tokens`` is the connector-agnostic evidence that the request
+    adopted remote KV; it is what the gate falls back to for a connector
+    without per-transfer Prometheus counters.
+    """
     return {
         "prompt": prompt,
         "pd": pd,
         "local": local if local is not None else pd,
         "local_prefix_hits": 0.0,
         "pd_transfer": transfer,
+        "pd_external_tokens": 200.0 if transfer else 0.0,
         "pd_failed": 0.0,
     }
 
@@ -148,10 +155,24 @@ def test_local_control_must_not_hit_the_prefix_cache(monkeypatch):
 
 def test_compared_pd_request_must_show_its_own_transfer(monkeypatch):
     """A zero-delta compared request proves nothing about disaggregation."""
+    pair = _pair("p0", "a", local="a", transfer=0.0)
+    # Isolate the NIXL counter gate: the external-token gate has its own test.
+    pair["pd_external_tokens"] = 200.0
     with pytest.raises(AssertionError, match="no KV transfer of their own"):
-        pd_test.test_pd_first_token_matches_local_prefill(
-            [_pair("p0", "a", local="a", transfer=0.0)]
-        )
+        pd_test.test_pd_first_token_matches_local_prefill([pair])
+
+
+def test_compared_pd_request_must_adopt_remote_tokens(monkeypatch):
+    """The connector-agnostic gate: no external tokens adopted.
+
+    This is the one that works for a connector without per-transfer
+    Prometheus counters (Mooncake), so it must not be satisfiable by the
+    NIXL-only counters alone.
+    """
+    pair = _pair("p0", "a", local="a", transfer=16.0)
+    pair["pd_external_tokens"] = 0.0
+    with pytest.raises(AssertionError, match="adopted no externally computed"):
+        pd_test.test_pd_first_token_matches_local_prefill([pair])
 
 
 def test_first_token_ab_passes_when_cold_and_transferred(monkeypatch):
@@ -182,5 +203,59 @@ def test_failed_transfer_on_a_compared_request_is_rejected():
     """A recovered (retried) transfer must not pass the clean-path gate."""
     pair = _pair("p0", "a", local="a", transfer=16.0)
     pair["pd_failed"] = 240.0
-    with pytest.raises(AssertionError, match="recorded a \\*failed\\* NIXL transfer"):
+    with pytest.raises(
+        AssertionError, match="recorded a \\*failed\\* NixlConnector transfer"
+    ):
         pd_test.test_pd_first_token_matches_local_prefill([pair])
+
+
+def test_mooncake_log_stats_sums_the_periodic_metrics_lines(tmp_path, monkeypatch):
+    """Mooncake's only failure counters live in its periodic log lines."""
+    log = tmp_path / "decode.log"
+    log.write_text(
+        "INFO some other line\n"
+        "INFO KV Transfer metrics: Num successful transfers=4, "
+        "Avg xfer time (ms)=1.2, Num failed transfers=0, Num failed recvs=0, "
+        "Num KV expired reqs=0\n"
+        "INFO KV Transfer metrics: Num successful transfers=2, "
+        "Avg xfer time (ms)=3.4, Num failed transfers=1, Num failed recvs=2, "
+        "Num KV expired reqs=3\n"
+    )
+    monkeypatch.setattr(pd_test, "DECODE_LOG", str(log))
+    stats = pd_test.mooncake_log_stats()
+    assert stats == {
+        "successful": 6.0,
+        "failed_transfers": 1.0,
+        "failed_recvs": 2.0,
+        "expired": 3.0,
+    }
+
+
+def test_mooncake_log_stats_is_empty_without_a_log_path(monkeypatch):
+    """Unset path must report "no evidence", never a silent pass."""
+    monkeypatch.setattr(pd_test, "DECODE_LOG", "")
+    assert pd_test.mooncake_log_stats() == {
+        "successful": 0.0,
+        "failed_transfers": 0.0,
+        "failed_recvs": 0.0,
+        "expired": 0.0,
+    }
+    assert not pd_test.mooncake_pull_failure_seen("10.255.255.1")
+
+
+def test_mooncake_pull_failure_needs_the_address_and_the_message(tmp_path, monkeypatch):
+    """A failed pull is proven by the bootstrap error, not by the IP alone."""
+    log = tmp_path / "decode.log"
+    log.write_text(
+        "INFO Failed to connect to bootstrap server "
+        "http://10.255.255.1:8998: refused\n"
+    )
+    monkeypatch.setattr(pd_test, "DECODE_LOG", str(log))
+    assert pd_test.mooncake_pull_failure_seen("10.255.255.1")
+    assert not pd_test.mooncake_pull_failure_seen("10.9.9.9")
+
+    log.write_text(
+        "INFO pulling kv_caches for ['r1'] failed: remote engine_id deadbeef not "
+        "found from bootstrap server http://10.255.255.1:8998\n"
+    )
+    assert pd_test.mooncake_pull_failure_seen("10.255.255.1")
