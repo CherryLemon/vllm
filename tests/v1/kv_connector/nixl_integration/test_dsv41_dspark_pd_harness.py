@@ -145,3 +145,58 @@ def test_cleanup_is_trapped_not_sequenced():
     assert "trap cleanup EXIT" in code
     # No cleanup call may sit after the role dispatch.
     assert "cleanup\n" not in code
+
+
+def test_services_are_killed_by_process_group_not_wrapper_shell():
+    """The recorded PID must be the service itself, in its own process group.
+
+    Regression: ``run_prefill & STARTED_PIDS+=($!)`` recorded a *function*
+    running in a subshell; killing that shell left the Python service (and the
+    TP workers it spawns) alive after the suite failed.  Now each service is
+    started under ``setsid`` by a shell that writes ``$$`` and then ``exec``s
+    Python, so the recorded PID is the service *and* its process-group id.
+    """
+    code = "\n".join(_code_lines(HARNESS.read_text()))
+    assert "setsid bash -c" in code
+    # The PID file is written by the shell that execs into the service.
+    assert 'printf "%s" "$$"' in code
+    assert "exec \"$@\"" in code
+    # Group kill (negative PID), TERM before KILL, with a grace period.
+    assert 'kill -"$sig" -- "-${pid}"' in code
+    term_lines = [line for line in code.splitlines() if 'kill_service "$pidfile" TERM' in line]
+    kill_lines = [line for line in code.splitlines() if 'kill_service "$pidfile" KILL' in line]
+    assert term_lines and kill_lines
+    term_idx = code.index('kill_service "$pidfile" TERM')
+    kill_idx = code.index('kill_service "$pidfile" KILL')
+    assert term_idx < kill_idx, "SIGKILL must not be the only signal sent"
+    assert "sleep 1" in code[term_idx:kill_idx], "no grace period between TERM and KILL"
+    # The old single-PID bookkeeping must be gone.
+    assert "STARTED_PIDS" not in code
+
+
+def test_common_args_are_untouched_by_the_process_work():
+    """The service argv still carries the JSON flags as single entries."""
+    cfg = harness_config()
+    args = args_of(cfg, "PREFILL_CMD")
+    assert args[args.index("--attention-config") + 1] == cfg["ATTENTION_CONFIG"]
+    spec_idx = args.index("--speculative-config") + 1
+    assert json.loads(args[spec_idx])["method"] == "dspark"
+    kv_idx = args.index("--kv-transfer-config") + 1
+    assert json.loads(args[kv_idx])["kv_role"] == "kv_producer"
+
+    cfg = harness_config()
+    args = args_of(cfg, "DECODE_CMD")
+    assert json.loads(args[args.index("--kv-transfer-config") + 1])["kv_role"] == (
+        "kv_consumer"
+    )
+    assert json.loads(args[args.index("--speculative-config") + 1])[
+        "num_speculative_tokens"
+    ] == 5
+
+
+def test_dev_mode_is_on_so_the_test_can_reset_caches():
+    """The acceptance test's independent local control needs /reset_prefix_cache."""
+    cfg = harness_config()
+    assert cfg["VLLM_SERVER_DEV_MODE"] == "1"
+    cfg = harness_config(VLLM_SERVER_DEV_MODE="0")
+    assert cfg["VLLM_SERVER_DEV_MODE"] == "0"

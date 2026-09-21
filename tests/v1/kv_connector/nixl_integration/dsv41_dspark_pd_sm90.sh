@@ -45,6 +45,9 @@
 #   PREFILL_SPEC_CONFIG / DECODE_SPEC_CONFIG - speculative configs
 #   ENABLE_GRAPHS       - 1 keeps CUDA graphs on (default 0 = --enforce-eager)
 #   BUCKETS             - capture sizes used when ENABLE_GRAPHS=1
+#   VLLM_SERVER_DEV_MODE - (default 1) exposes /reset_prefix_cache, which the
+#                         acceptance test uses to keep the PD request and the
+#                         local-prefill control cold (and therefore independent)
 #   DSV41_STRICT_REFERENCE - 1 makes the reference comparison a hard gate
 set -euo pipefail
 
@@ -98,23 +101,98 @@ export VLLM_SM90_FP4_INDEXER="${VLLM_SM90_FP4_INDEXER:-1}"
 export VLLM_SM90_FP8_BLOCK32_STATIC="${VLLM_SM90_FP8_BLOCK32_STATIC:-1}"
 export VLLM_SM90_MHC_SPLIT_H="${VLLM_SM90_MHC_SPLIT_H:-1}"
 
+# The acceptance test resets the decode instance's prefix cache between the PD
+# request and the local control (`POST /reset_prefix_cache?reset_external=true`)
+# so the two cannot share a cache entry.  That endpoint lives behind the dev
+# routers, which exist only when VLLM_SERVER_DEV_MODE=1.  This is a test
+# harness, never a production deployment; the flag is documented in the header.
+export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
+
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-log() { echo "[dsv41_dspark_pd] $*"; }
+# Diagnostics go to stderr so stdout stays a pure `KEY=value` stream for the
+# harness self-test (which parses one key per line).
+log() { echo "[dsv41_dspark_pd] $*" >&2; }
 
-# PIDs started by this invocation, killed on any exit -- including a failing
-# test under `set -e`, which previously skipped the cleanup block entirely.
-STARTED_PIDS=()
+# Process management.  Every service runs in its own session (``setsid``) and
+# records its real PID -- the shell that ``setsid`` starts writes ``$$`` and
+# then ``exec``s Python, so the recorded PID *is* the service process and also
+# its process-group id.  Killing the group takes the TP worker processes with
+# it; killing a backgrounded wrapper shell (the old behaviour) left Python and
+# its workers alive.
+PID_DIR="$(mktemp -d)"
+SERVICE_PIDFILES=()
+
+_svc_pidfile() { printf '%s/%s.pid' "$PID_DIR" "$1"; }
+
+start_service() {
+  local name="$1"
+  shift
+  local pidfile
+  pidfile="$(_svc_pidfile "$name")"
+  log "starting ${name} (pidfile ${pidfile})"
+  setsid bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' \
+    _ "$pidfile" "$@" &
+  SERVICE_PIDFILES+=("$pidfile")
+}
+
+_service_pid() {
+  local pidfile="$1" pid
+  [ -s "$pidfile" ] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "${pid:-}" ] || return 1
+  printf '%s' "$pid"
+}
+
+kill_service() {
+  local pidfile="$1" sig="$2" pid
+  pid="$(_service_pid "$pidfile")" || return 0
+  # Negative PID = the whole process group (the service plus every worker it
+  # spawned); fall back to the single process if the group is already gone.
+  kill -"$sig" -- "-${pid}" 2>/dev/null || kill -"$sig" "$pid" 2>/dev/null || true
+}
+
 cleanup() {
-  local pid
-  for pid in "${STARTED_PIDS[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  local pidfile pid still_alive
+  # SIGTERM first and give the services a moment for an orderly shutdown
+  # (NIXL/zmq teardown); only escalate to SIGKILL for what is still alive.
+  for pidfile in "${SERVICE_PIDFILES[@]:-}"; do
+    [ -n "$pidfile" ] && kill_service "$pidfile" TERM
   done
-  for pid in "${STARTED_PIDS[@]:-}"; do
-    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+  local waited=0
+  while (( waited < 15 )); do
+    still_alive=0
+    for pidfile in "${SERVICE_PIDFILES[@]:-}"; do
+      [ -z "$pidfile" ] && continue
+      if pid="$(_service_pid "$pidfile")" && kill -0 "$pid" 2>/dev/null; then
+        still_alive=1
+      fi
+    done
+    (( still_alive == 0 )) && break
+    sleep 1
+    waited=$((waited + 1))
   done
+  for pidfile in "${SERVICE_PIDFILES[@]:-}"; do
+    [ -n "$pidfile" ] && kill_service "$pidfile" KILL
+  done
+  rm -rf "$PID_DIR"
 }
 trap cleanup EXIT
+
+# Block until the service has recorded its PID, then until it exits.  ``wait``
+# cannot be used: the service is not a direct child of this shell.
+wait_service() {
+  local name="$1" pidfile pid i
+  pidfile="$(_svc_pidfile "$name")"
+  for ((i = 0; i < 240; i++)); do
+    pid="$(_service_pid "$pidfile")" && break
+    sleep 0.5
+  done
+  [ -n "${pid:-}" ] || { log "FAIL: ${name} never recorded a PID"; return 1; }
+  log "${name} running as pid ${pid}"
+  while kill -0 "$pid" 2>/dev/null; do sleep 2; done
+  log "${name} exited"
+}
 
 wait_for_http() {
   local url="$1" name="$2" deadline="${3:-3600}" elapsed=0
@@ -166,42 +244,55 @@ common_args() {
   fi
 }
 
-run_prefill() {
+# Each service command is built into the ``CMD`` array (one element per argv
+# entry) instead of being a function that shells out; ``start_service`` runs it
+# under ``setsid`` so the recorded PID is the service itself.  ``env`` carries
+# the per-service NIXL channel variables without relying on inline
+# ``VAR=value cmd`` parsing.
+prefill_cmd() {
   common_args
-  log "starting prefill instance on port ${PREFILL_PORT} (graphs=$ENABLE_GRAPHS)"
-  VLLM_NIXL_SIDE_CHANNEL_HOST="$NIXL_SIDE_CHANNEL_HOST" \
-  VLLM_NIXL_SIDE_CHANNEL_PORT="$PREFILL_SIDE_CHANNEL_PORT" \
-  "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
-    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}" \
-    --port "$PREFILL_PORT" \
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}' \
+  CMD=(
+    env
+    "VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}"
+    "VLLM_NIXL_SIDE_CHANNEL_PORT=${PREFILL_SIDE_CHANNEL_PORT}"
+    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
+    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}"
+    --port "$PREFILL_PORT"
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
     --speculative-config "$PREFILL_SPEC_CONFIG"
+  )
+  log "prefill instance on port ${PREFILL_PORT} (graphs=$ENABLE_GRAPHS)"
 }
 
-run_decode() {
+decode_cmd() {
   common_args
-  log "starting decode instance on port ${DECODE_PORT} (graphs=$ENABLE_GRAPHS)"
-  VLLM_NIXL_SIDE_CHANNEL_HOST="$NIXL_SIDE_CHANNEL_HOST" \
-  VLLM_NIXL_SIDE_CHANNEL_PORT="$DECODE_SIDE_CHANNEL_PORT" \
-  "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
-    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}" \
-    --port "$DECODE_PORT" \
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}' \
+  CMD=(
+    env
+    "VLLM_NIXL_SIDE_CHANNEL_HOST=${NIXL_SIDE_CHANNEL_HOST}"
+    "VLLM_NIXL_SIDE_CHANNEL_PORT=${DECODE_SIDE_CHANNEL_PORT}"
+    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
+    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}"
+    --port "$DECODE_PORT"
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
     --speculative-config "$DECODE_SPEC_CONFIG"
+  )
+  log "decode instance on port ${DECODE_PORT} (graphs=$ENABLE_GRAPHS)"
 }
 
-run_proxy() {
+proxy_cmd() {
   local p_hosts=() d_hosts=()
   IFS=',' read -r -a p_hosts <<< "$PREFILL_HOSTS"
   IFS=',' read -r -a d_hosts <<< "$DECODE_HOSTS"
-  log "starting toy proxy on ${PROXY_HOST}:${PROXY_PORT}"
-  "$PYTHON_BIN" "${SCRIPT_DIR}/toy_proxy_server.py" \
-    --host "$PROXY_HOST" \
-    --port "$PROXY_PORT" \
-    --prefiller-hosts "${p_hosts[@]}" \
-    --prefiller-ports "$PREFILL_PORT" \
-    --decoder-hosts "${d_hosts[@]}" \
+  CMD=(
+    "$PYTHON_BIN" "${SCRIPT_DIR}/toy_proxy_server.py"
+    --host "$PROXY_HOST"
+    --port "$PROXY_PORT"
+    --prefiller-hosts "${p_hosts[@]}"
+    --prefiller-ports "$PREFILL_PORT"
+    --decoder-hosts "${d_hosts[@]}"
     --decoder-ports "$DECODE_PORT"
+  )
+  log "toy proxy on ${PROXY_HOST}:${PROXY_PORT}"
 }
 
 run_test() {
@@ -221,9 +312,9 @@ run_test() {
 }
 
 case "$ROLE" in
-  prefill) run_prefill ;;
-  decode)  run_decode ;;
-  proxy)   run_proxy ;;
+  prefill) prefill_cmd; start_service prefill "${CMD[@]}"; wait_service prefill ;;
+  decode)  decode_cmd;  start_service decode  "${CMD[@]}"; wait_service decode ;;
+  proxy)   proxy_cmd;   start_service proxy   "${CMD[@]}"; wait_service proxy ;;
   test)    run_test ;;
   # Machine-readable resolution of the serve flags, for the harness'
   # self-test: it exercises the JSON defaults/overrides and the eager/graph
@@ -234,17 +325,24 @@ case "$ROLE" in
     printf 'PREFILL_SPEC_CONFIG=%s\n' "$PREFILL_SPEC_CONFIG"
     printf 'DECODE_SPEC_CONFIG=%s\n' "$DECODE_SPEC_CONFIG"
     printf 'DECODE_HOST=%s\n' "$DECODE_HOST"
+    printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
     printf 'COMMON_ARGS_COUNT=%d\n' "${#COMMON_ARGS[@]}"
     printf 'COMMON_ARGS=%s\n' "$(printf '%s\x1f' "${COMMON_ARGS[@]}")"
     printf 'GRAPH_ARGS_COUNT=%d\n' "${#GRAPH_ARGS[@]}"
     printf 'GRAPH_ARGS=%s\n' "$(printf '%s\x1f' "${GRAPH_ARGS[@]}")"
+    # Exercise the command builders too: the argv arrays are what the process
+    # manager actually launches, and they must survive JSON values with braces.
+    prefill_cmd
+    printf 'PREFILL_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
+    decode_cmd
+    printf 'DECODE_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
     ;;
   all)
-    run_prefill & STARTED_PIDS+=($!)
-    run_decode  & STARTED_PIDS+=($!)
+    prefill_cmd; start_service prefill "${CMD[@]}"
+    decode_cmd;  start_service decode  "${CMD[@]}"
     wait_for_http "http://${SERVER_HOST}:${PREFILL_PORT}/health" "prefill"
     wait_for_http "http://${SERVER_HOST}:${DECODE_PORT}/health" "decode"
-    run_proxy & STARTED_PIDS+=($!)
+    proxy_cmd; start_service proxy "${CMD[@]}"
     wait_for_http "http://${PROXY_HOST}:${PROXY_PORT}/healthcheck" "proxy" 120
     run_test
     ;;

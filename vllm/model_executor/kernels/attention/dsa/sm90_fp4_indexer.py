@@ -56,7 +56,6 @@ _NUM_WARPS = 4
 _GROUP6 = 6
 _GROUP6_PGROUP = 8
 
-
 def has_sm90_fp4_indexer() -> bool:
     """True on family(90) CUDA when ``VLLM_SM90_FP4_INDEXER`` is enabled.
 
@@ -540,6 +539,7 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     PGROUP: tl.constexpr,
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
+    SKIP_INVALID: tl.constexpr,
 ):
     first = tl.program_id(0) * GROUP
     lb = tl.program_id(1)
@@ -553,7 +553,7 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     # Dense-only early exit: when the whole tile is invisible to every row the
     # shared load would be all-masked anyway.  Compact columns are unordered
     # and may legitimately extend past ``n_vis``, so there is no equivalent
-    # bound there (same reasoning as the per-row kernel's compact mask).
+    # O(1) bound there (same reasoning as the per-row kernel's compact mask).
     # Keep the constexpr gate separate from the runtime bound: ``USE_CANDIDATES``
     # is compile-time and must not force the runtime comparison into a Tensor.
     if not USE_CANDIDATES:  # noqa: SIM102
@@ -566,15 +566,52 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
                     )
             return
 
+    # Compact early exit, opt-in (``VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES``)
+    # because the "no row sees this tile" test costs one 64-wide candidate
+    # gather per row instead of the dense O(1) bound.  It mirrors the per-row
+    # compact predicate exactly: a column is visible for a row when its mapped
+    # logical position is inside that row's context length.  Without this the
+    # grouped compact path had no all-invisible skip at all, so the two opt-in
+    # optimisations could not be assumed to compose.
+    if USE_CANDIDATES and SKIP_INVALID:  # noqa: SIM102
+        col_block = offs_l // CANDIDATE_BLOCK_SIZE
+        within = offs_l % CANDIDATE_BLOCK_SIZE
+        n_blocks_row = width // CANDIDATE_BLOCK_SIZE
+        any_visible = tl.zeros([BLOCK_L], dtype=tl.int32)
+        for j in tl.range(0, GROUP, loop_unroll_factor=1):
+            b = first + j
+            if b < n_rows:
+                n_vis_b = tl.load(context_lens_ptr + b)
+                ids = tl.load(
+                    candidate_blocks_ptr + b * stride_cb + col_block,
+                    mask=(offs_l < width) & (col_block < n_blocks_row),
+                    other=-1,
+                )
+                logical = ids.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
+                any_visible = any_visible | (
+                    (offs_l < width) & (ids >= 0) & (logical < n_vis_b)
+                ).to(tl.int32)
+        if tl.sum(any_visible, 0) == 0:
+            for j in tl.range(0, GROUP, loop_unroll_factor=1):
+                b = first + j
+                if b < n_rows:
+                    _sm90_fp4_group_invalid(
+                        out_ptr, b, offs_l, width, stride_out, BLOCK_L
+                    )
+            return
+
     # Request identity is checked on device on every replay: the six rows of a
     # group must all belong to the leader's request, else the shared tile is
     # wrong and the group falls back to per-row K reloads.
     req0 = tl.load(row_indices_ptr + first)
-    # Masked lanes (a partial last group) never score, so their ``other`` value
-    # only needs to not match a real leader id spuriously: ``0`` is safe either
-    # way (a spurious mismatch merely forces the per-row fallback).
+    # ``PGROUP`` (8) reduction lanes cover only ``GROUP`` (6) real rows, so the
+    # padding lanes must be masked out of the comparison: their ``other`` value
+    # (0) is not a real request id, and comparing it made ``share`` False for
+    # *every* full group whose request id was non-zero, silently turning the K
+    # reuse into a per-row reload on every CTA (including partial last groups,
+    # which never had a chance to share).
     reqs = tl.load(row_indices_ptr + rows, mask=gmask, other=0)
-    share = tl.sum((reqs != req0).to(tl.int32), 0) == 0
+    share = tl.sum(((reqs != req0) & gmask).to(tl.int32), 0) == 0
 
     if USE_CANDIDATES:
         # Compact extension: the shared tile is exact only if every row maps
@@ -752,7 +789,15 @@ def _sm90_fp4_workspace_index_logits_kernel(
             visible = (offs_l < width) & (block >= 0) & (k_row < ke)
             tile_invisible = tl.sum(visible.to(tl.int32), axis=0) == 0
         else:
-            tile_invisible = (lb * BLOCK_L >= ke) | ((lb + 1) * BLOCK_L <= ks)
+            # ``ks >= ke`` is an empty interval: a row whose workspace scope has
+            # no positions at all (possible for a clamped/degenerate decode
+            # row) scores nothing, yet neither half-open bound test above fires
+            # for a tile that merely brackets the empty interval.
+            tile_invisible = (
+                (ks >= ke)
+                | (lb * BLOCK_L >= ke)
+                | ((lb + 1) * BLOCK_L <= ks)
+            )
         if tile_invisible:
             tl.store(
                 out_ptr + row * stride_out + offs_l,
@@ -1032,6 +1077,7 @@ def sm90_fp4_paged_index_logits(
             PGROUP=_GROUP6_PGROUP,
             USE_CANDIDATES=use_candidates,
             CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
+            SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
             num_warps=_NUM_WARPS,
         )
         # ``use_grouped`` requires ``not write_candidates``, so the grouped

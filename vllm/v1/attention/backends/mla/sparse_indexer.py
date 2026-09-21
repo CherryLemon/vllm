@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadataBuilder,
     DeepseekV41IndexerBackend,
     dsa_indexer_uses_fp4,
+    get_row_request_ids,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -248,6 +249,7 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
             # decode tensors are already per row.
             assert decode.seq_lens.shape[1] == 1 and not decode.requires_padding
             assert decode.block_table.shape[0] == rows
+            row_request_ids = get_row_request_ids(decode)
             metadata.sparse_decode = self._rows(
                 0,
                 rows,
@@ -255,8 +257,12 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
                 row_ke=decode.seq_lens.view(-1),
                 block_table=decode.block_table,
                 row_indices=(
-                    decode.indices
-                    if decode.indices is not None
+                    # Row -> request id map for the grouped kernel: the dense
+                    # flatten builder publishes ``row_request_ids``, the varlen
+                    # builder publishes ``indices``.  Only the latter may reach
+                    # DeepGEMM, so the two fields stay distinct.
+                    row_request_ids
+                    if row_request_ids is not None
                     else self.arange_buffer[:rows]
                 ),
                 spec_group_size=getattr(decode, "spec_group_size", 1),

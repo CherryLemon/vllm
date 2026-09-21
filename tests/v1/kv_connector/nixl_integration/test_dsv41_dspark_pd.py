@@ -24,10 +24,17 @@ as evidence:
    ``do_remote_prefill`` request pointed at an unreachable producer must not
    answer).
 
-3. **The output is right.**  Compared against what the *same decode instance*
-   produces from a plain local prefill of the same prompt.  That A/B is
-   self-contained and cannot be satisfied by a path that ignores the transfer:
-   the two sides differ only in where the prefill KV came from.
+3. **The output is right, against an independent control.**  The first token
+   from the PD request is compared with the first token of a plain local
+   prefill on the same decode instance.  Both sides are taken **cold**: the
+   decode instance's prefix cache (including the connector-managed external
+   cache) is reset and the reset is verified before *each* request, and the
+   local request is additionally required to record zero prefix-cache hits.
+   Without that, the "control" could be served from the very cache entry the
+   PD request created -- a comparison that is guaranteed to succeed and proves
+   nothing.  The transfer counters are also sampled around the *individual* PD
+   request whose first token is compared, so "the compared request really
+   pulled remote KV" is established rather than assumed.
 
    The comparison is on the **first token**, which is read straight off the
    transferred prefill context and is measured stable (10/10 identical repeats
@@ -50,8 +57,12 @@ as evidence:
   test reported success while testing nothing.
 * **Prompts must not already sit in the decode instance's prefix cache.**
   Each run salts the filler with a unique token, so a run cannot be served from
-  a previous run's cache.  Without this the transfer delta is 0 and the run
-  proves nothing.
+  a previous run's cache.  That is necessary but *not sufficient* within one
+  run: the salted prompts are still shared by the PD leg and the local control
+  leg, so the local control would hit the entry the PD leg just created.  Both
+  legs therefore reset the decode instance's prefix cache first (and the local
+  leg's zero-hit requirement is asserted), which is what makes the control
+  independent.  See the module docstring point 3.
 
 Environment variables (set by ``dsv41_dspark_pd_sm90.sh``):
     TEST_MODEL              - served model name (default: deepseek-v4.1-flash)
@@ -63,12 +74,17 @@ Environment variables (set by ``dsv41_dspark_pd_sm90.sh``):
     DSV41_PD_RUN_SALT       - fixed salt, for reproducing a run
     DSV41_DSPARK_REFERENCE  - optional standalone reference JSON (extra check)
     DSV41_STRICT_REFERENCE  - 1 makes that optional check required
+    DSV41_COLD_RESET        - 0 disables the per-request prefix-cache reset
+                              (default 1).  Only for debugging a server without
+                              VLLM_SERVER_DEV_MODE=1; disabling it weakens the
+                              local control back to the old shared-cache case.
 """
 
 import json
 import os
 import time
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import openai
 import pytest
@@ -82,6 +98,10 @@ NUM_PROMPTS = int(os.environ.get("NUM_PROMPTS", "4"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 REFERENCE = os.environ.get("DSV41_DSPARK_REFERENCE", "")
 STRICT = os.environ.get("DSV41_STRICT_REFERENCE", "0") == "1"
+# The per-request prefix-cache reset is what makes the local control
+# independent; it is on by default and only turned off to debug a server that
+# was started without VLLM_SERVER_DEV_MODE=1.
+COLD_RESET = os.environ.get("DSV41_COLD_RESET", "1") == "1"
 
 # Mirrors the model's SWA bounded-replay window; see the module docstring.
 SWA_REPLAY_TOKENS = int(os.environ.get("DSV41_SWA_REPLAY_TOKENS", "128"))
@@ -115,6 +135,9 @@ NIXL_POST_COUNT = "vllm:nixl_post_time_seconds_count"
 NIXL_FAILED_XFER = "vllm:nixl_num_failed_transfers_total"
 NIXL_FAILED_NOTIFY = "vllm:nixl_num_failed_notifications_total"
 NIXL_EXPIRED = "vllm:nixl_num_kv_expired_reqs_total"
+# Local prefix-cache evidence: the control leg must show a *zero* hit delta.
+PREFIX_QUERIES = "vllm:prefix_cache_queries_total"
+PREFIX_HITS = "vllm:prefix_cache_hits_total"
 
 ALL_METRICS = (
     SPEC_DRAFTS,
@@ -125,6 +148,15 @@ ALL_METRICS = (
     NIXL_FAILED_XFER,
     NIXL_FAILED_NOTIFY,
     NIXL_EXPIRED,
+)
+
+TRANSFER_METRICS = (
+    NIXL_XFER_COUNT,
+    NIXL_POST_COUNT,
+    NIXL_FAILED_XFER,
+    NIXL_FAILED_NOTIFY,
+    PREFIX_QUERIES,
+    PREFIX_HITS,
 )
 
 
@@ -188,6 +220,61 @@ def _complete(
     return _complete_resp(PROXY_BASE_URL, prompt, max_tokens, extra_body).choices[0].text
 
 
+def reset_decode_prefix_cache() -> bool:
+    """Drop every cached prefix on the decode instance.
+
+    ``reset_external=true`` also asks the connector to drop its own cache; that
+    is a no-op for connectors which do not implement ``reset_cache()``
+    (NixlConnector returns ``None``, which the scheduler treats as success), and
+    the *local* prefix cache -- the one that could serve the local control from
+    the PD request's entry -- is cleared either way.
+
+    The endpoint is behind the dev routers (``VLLM_SERVER_DEV_MODE=1``) and
+    reports ``success=false`` while blocks are still held; retry briefly rather
+    than accepting a partial reset, because a surviving entry is exactly the
+    confound this call exists to remove.
+    """
+    url = (
+        f"http://{DECODE_HOST}:{DECODE_PORT}/reset_prefix_cache"
+        "?reset_running_requests=true&reset_external=true"
+    )
+    last_error = ""
+    for attempt in range(10):
+        try:
+            body = json.loads(
+                urlopen(Request(url, method="POST"), timeout=60).read().decode()
+            )
+        except HTTPError as exc:
+            if exc.code in (404, 405):
+                pytest.fail(
+                    f"{url} returned HTTP {exc.code}: the dev endpoints are "
+                    "disabled, so the local control cannot be made independent "
+                    "from the PD request's cache entry. Start the decode "
+                    "instance with VLLM_SERVER_DEV_MODE=1."
+                )
+            if exc.code >= 500:
+                # The scheduler raises while blocks are still held (e.g. a
+                # request parked on a remote transfer); retry, then fail loudly.
+                last_error = f"HTTP {exc.code}"
+                time.sleep(1 + attempt)
+                continue
+            raise
+        if body.get("success"):
+            return True
+        last_error = f"success=false ({body})"
+        time.sleep(1 + attempt)
+    print(f"prefix-cache reset did not succeed: {last_error}")
+    return False
+
+
+def decode_is_healthy() -> bool:
+    try:
+        urlopen(f"http://{DECODE_HOST}:{DECODE_PORT}/health", timeout=30).read()
+        return True
+    except Exception:  # noqa: BLE001 - "still serving" is the assertion
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Fixtures: one measured PD round, plus the local-prefill control
 # ---------------------------------------------------------------------------
@@ -200,7 +287,12 @@ def prompts() -> list[str]:
 
 @pytest.fixture(scope="module")
 def round_metrics(prompts):
-    """Metrics bracketing the PD round, plus that round's outputs."""
+    """Metrics bracketing the PD round, plus that round's outputs.
+
+    Only full-output requests run here.  The single-token tokens used for the
+    A/B live in ``first_token_ab``, because they need a cache reset immediately
+    around each request and must not be mixed into this cumulative delta.
+    """
     before = scrape(DECODE_METRICS_URL, ALL_METRICS)
     outputs: list[str] = []
     prompt_tokens: list[int] = []
@@ -209,31 +301,65 @@ def round_metrics(prompts):
         outputs.append(resp.choices[0].text)
         # Prompt length from a real call: a max_tokens=0 probe is rejected 400.
         prompt_tokens.append(int(resp.usage.prompt_tokens))
-    first_tokens = [_complete(p, max_tokens=1) for p in prompts]
     after = scrape(DECODE_METRICS_URL, ALL_METRICS)
     return {
         "before": before,
         "after": after,
         "delta": delta(before, after),
         "outputs": outputs,
-        "first_tokens": first_tokens,
         "prompt_tokens": prompt_tokens,
     }
 
 
 @pytest.fixture(scope="module")
-def local_first_tokens(prompts):
-    """The same prompts prefilled and decoded locally on the decode instance.
+def first_token_ab(prompts):
+    """Cold PD vs cold local first tokens, one independently reset pair each.
 
-    No ``kv_transfer_params``, so this is a plain (non-disaggregated) run on the
-    very same server.  Comparing against it isolates the only thing under test:
-    whether the KV the decode instance used was the one the prefill instance
-    produced.
+    The order is deliberate: reset -> local -> reset -> PD, so neither request
+    can see the other's prefix cache entry.  The reset itself is verified (the
+    endpoint reports success), the local leg must record **zero** prefix-cache
+    hits, and the transfer counters are sampled around the single PD request
+    whose first token is actually compared.
     """
-    return [
-        _complete_resp(DECODE_BASE_URL, p, max_tokens=1).choices[0].text
-        for p in prompts
-    ]
+    pairs = []
+    for prompt in prompts:
+        local_hits = None
+        local_first = None
+        if COLD_RESET:
+            assert reset_decode_prefix_cache(), (
+                "the decode instance refused to reset its prefix cache "
+                "(reset_external=true); the local control cannot be trusted"
+            )
+        hits_before = scrape(DECODE_METRICS_URL, (PREFIX_QUERIES, PREFIX_HITS))
+        local_first = _complete_resp(DECODE_BASE_URL, prompt, max_tokens=1).choices[
+            0
+        ].text
+        hits_after = scrape(DECODE_METRICS_URL, (PREFIX_QUERIES, PREFIX_HITS))
+        local_hits = hits_after[PREFIX_HITS] - hits_before[PREFIX_HITS]
+
+        if COLD_RESET:
+            assert reset_decode_prefix_cache(), (
+                "the decode instance refused the second (pre-PD) prefix-cache "
+                "reset, so the PD request may be served from the local cache "
+                "entry the control just created"
+            )
+        before = scrape(DECODE_METRICS_URL, TRANSFER_METRICS)
+        pd_first = _complete_resp(PROXY_BASE_URL, prompt, max_tokens=1).choices[0].text
+        after = scrape(DECODE_METRICS_URL, TRANSFER_METRICS)
+        pair_delta = delta(before, after)
+        pairs.append(
+            {
+                "prompt": prompt,
+                "pd": pd_first,
+                "local": local_first,
+                "local_prefix_hits": local_hits,
+                "pd_transfer": pair_delta[NIXL_XFER_COUNT]
+                + pair_delta[NIXL_POST_COUNT],
+                "pd_failed": pair_delta[NIXL_FAILED_XFER]
+                + pair_delta[NIXL_FAILED_NOTIFY],
+            }
+        )
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +449,13 @@ def test_kv_transfer_is_actually_used(round_metrics):
         "pp_size": 1,
         "transfer_mode": "pull",
     }
+    # Sample the failure counters across the negative control only, so a
+    # "transfer failed" claim cannot be inherited from an unrelated step.
+    before = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
     started = time.time()
+    answered = None
+    failure: Exception | None = None
     try:
-        # The producer is unreachable, so the scheduler parks the request
-        # waiting for KV that never arrives.  The assertion is "must not
-        # answer", not "must fail in exactly this way".
         resp = _complete_resp(
             DECODE_BASE_URL,
             novel,
@@ -335,19 +463,61 @@ def test_kv_transfer_is_actually_used(round_metrics):
             extra_body={"kv_transfer_params": bogus},
             timeout=60.0,
         )
-        text = resp.choices[0].text
-    except Exception as exc:  # noqa: BLE001 - failure/timeout is the expected outcome
-        print(
-            f"negative control did not answer, as expected: {type(exc).__name__} "
-            f"after {time.time() - started:.1f}s"
+        answered = resp.choices[0].text
+    except openai.BadRequestError as exc:
+        # A rejected request never reached the connector: it proves nothing
+        # about remote prefill, and accepting it was the old bug.
+        pytest.fail(
+            "the negative control was rejected by request validation before it "
+            f"could reach the connector (HTTP {exc.status_code}). Build the "
+            "bogus params from a metadata block the server already accepted, "
+            "changing only the producer address."
         )
-        return
-    pytest.fail(
-        "the decode instance answered a do_remote_prefill request whose "
-        f"producer (10.255.255.1:5999) is unreachable, in "
-        f"{time.time() - started:.1f}s: {text[:40]!r}. That is only possible by "
-        "recomputing the prefill locally, so remote prefill is not in effect."
+    except openai.APIConnectionError as exc:
+        pytest.fail(
+            "the negative control could not reach the *decode* service at all "
+            f"({type(exc).__name__}), so no request was ever made"
+        )
+    except Exception as exc:  # noqa: BLE001 - timeout/524 is the expected outcome
+        failure = exc
+    elapsed = time.time() - started
+
+    if answered is not None:
+        pytest.fail(
+            "the decode instance answered a do_remote_prefill request whose "
+            f"producer (10.255.255.1:5999) is unreachable, in {elapsed:.1f}s: "
+            f"{answered[:40]!r}. That is only possible by recomputing the "
+            "prefill locally, so remote prefill is not in effect."
+        )
+
+    after = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
+    failed = delta(before, after)
+    failure_evidence = failed[NIXL_FAILED_XFER] + failed[NIXL_FAILED_NOTIFY]
+    parked = elapsed >= 30.0
+    print(
+        f"negative control: no answer after {elapsed:.1f}s "
+        f"({type(failure).__name__ if failure else 'no exception'}), "
+        f"transfer failures +{failure_evidence:.0f}"
     )
+    assert failure_evidence > 0 or parked, (
+        "the negative control did not answer, but there is no evidence it "
+        "reached the connector: the failure counters stayed flat and the "
+        f"request returned in {elapsed:.1f}s. A fast non-answer looks like a "
+        "rejected/no-op request, not like a stalled remote pull.\n"
+        f"  {type(failure).__name__ if failure else 'no exception'}"
+    )
+    assert decode_is_healthy(), (
+        "the decode instance stopped serving after the negative control; the "
+        "unreachable producer must not wedge the engine"
+    )
+    # The engine must also still *schedule*: a stuck waiting queue would leave
+    # /health green.  This probe is a plain local request.
+    probe = _complete_resp(
+        DECODE_BASE_URL,
+        f"[pd-negative-control-probe-{time.time_ns()}] hello",
+        max_tokens=1,
+    )
+    assert probe.choices, "the decode instance scheduled nothing after the control"
 
 
 # ---------------------------------------------------------------------------
@@ -355,31 +525,57 @@ def test_kv_transfer_is_actually_used(round_metrics):
 # ---------------------------------------------------------------------------
 
 
-def test_pd_first_token_matches_local_prefill(
-    prompts, round_metrics, local_first_tokens
-):
-    """The core transport-correctness gate, self-contained.
+def test_pd_first_token_matches_local_prefill(first_token_ab):
+    """The core transport-correctness gate, on a genuinely independent A/B.
 
-    Both sides run on the same decode instance with the same prompts and
+    Both sides run on the same decode instance with the same prompt and
     ``temperature=0``; the only difference is whether the prefill KV arrived
-    over NIXL or was computed locally.  The first token is read straight off
-    that context and is measured stable, so a lossy or misplaced transfer
-    changes it.
+    over NIXL or was computed locally.  Cache state is not left to chance: each
+    leg is preceded by a verified prefix-cache reset, the local leg must record
+    no prefix-cache hit, and the PD leg must record a real transfer -- so the
+    comparison cannot be satisfied by both legs reading one shared cache entry.
     """
-    assert len(local_first_tokens) == len(prompts)
-    mismatches = [
-        (p, want, got)
-        for p, got, want in zip(
-            prompts, round_metrics["first_tokens"], local_first_tokens
+    assert first_token_ab, "no prompt pairs were measured"
+    if COLD_RESET:
+        polluted = [
+            p for p in first_token_ab if p["local_prefix_hits"] > 0
+        ]
+        assert not polluted, (
+            "the local control leg hit the decode instance's prefix cache for "
+            f"{len(polluted)}/{len(first_token_ab)} prompts despite a reset "
+            "(hits: "
+            + ", ".join(f"{p['local_prefix_hits']:.0f}" for p in polluted)
+            + "). The comparison would be against the PD request's own cache "
+            "entry. Check that /reset_prefix_cache?reset_external=true really "
+            "clears the connector cache."
         )
-        if got != want
+    no_transfer = [p for p in first_token_ab if p["pd_transfer"] <= 0]
+    assert not no_transfer, (
+        f"{len(no_transfer)}/{len(first_token_ab)} compared PD requests recorded "
+        "no KV transfer of their own, so their first token cannot be evidence "
+        "about disaggregation (it came from a local prefill or a cache hit):\n"
+        + "\n".join(
+            f"  {p['prompt'][:50]!r} transfer_delta={p['pd_transfer']:.0f}"
+            for p in no_transfer
+        )
+    )
+
+    mismatches = [
+        (p["prompt"], p["local"], p["pd"])
+        for p in first_token_ab
+        if p["pd"] != p["local"]
     ]
     assert not mismatches, (
-        f"{len(mismatches)}/{len(prompts)} prompts differ between the PD path and "
-        "a local prefill of the same prompt:\n"
+        f"{len(mismatches)}/{len(first_token_ab)} prompts differ between the PD "
+        "path and a local prefill of the same prompt:\n"
         + "\n".join(
-            f"  {p[:60]!r}\n    local={w!r}\n    pd   ={g!r}" for p, w, g in mismatches
+            f"  {p!r}\n    local={w!r}\n    pd   ={g!r}" for p, w, g in mismatches
         )
+    )
+    print(
+        f"\nfirst-token A/B this round: {len(first_token_ab) - len(mismatches)}"
+        f"/{len(first_token_ab)} identical; PD transfers per compared request: "
+        + ", ".join(f"{p['pd_transfer']:.0f}" for p in first_token_ab)
     )
 
 
@@ -392,12 +588,18 @@ def test_pd_outputs_are_non_degenerate(round_metrics):
 # ---------------------------------------------------------------------------
 
 
-def test_pd_matches_recorded_standalone_reference(prompts, round_metrics):
+def test_pd_matches_recorded_standalone_reference(first_token_ab):
     """Extra check against a reference dumped by ``dsv41_dspark_reference.py``.
 
     Optional because the reference's prompts cannot be run-unique, so a
     mismatch here can also mean the decode instance answered partly from its own
     prefix cache.  The self-contained local A/B above is the real gate.
+
+    Strict mode (``DSV41_STRICT_REFERENCE=1``) must not be satisfiable by
+    comparing *fewer* prompts than were sent: the reference is checked for
+    model/salt identity, every prompt is required to have an entry, and the
+    comparison count is asserted -- "0 compared, skipped" and "1 of 4 compared,
+    passed" were both accepted before.
     """
     if not REFERENCE:
         if STRICT:
@@ -407,17 +609,44 @@ def test_pd_matches_recorded_standalone_reference(prompts, round_metrics):
         ref = json.load(fh)
     assert isinstance(ref, dict) and ref, f"{REFERENCE} is not a non-empty JSON object"
 
+    prompts = [p["prompt"] for p in first_token_ab]
+    got_by_prompt = {p["prompt"]: p["pd"] for p in first_token_ab}
+    if STRICT:
+        meta = ref.get("__meta__", {})
+        if isinstance(meta, dict):
+            for key, have in (("model", MODEL_NAME), ("run_salt", RUN_SALT)):
+                want = meta.get(key)
+                if want is not None and want != have:
+                    pytest.fail(
+                        f"reference {key}={want!r} does not match this run "
+                        f"({have!r}): its tokens are not comparable"
+                    )
+
     compared = 0
+    missing: list[str] = []
     mismatches = []
-    for prompt, got in zip(prompts, round_metrics["first_tokens"]):
+    for prompt in prompts:
         entry = ref.get(prompt)
         if entry is None:
+            missing.append(prompt)
             continue
         compared += 1
+        got = got_by_prompt[prompt]
         want = entry["first_token"] if isinstance(entry, dict) else entry[: len(got)]
         if got != want:
             mismatches.append((prompt, want, got))
-    if compared == 0:
+
+    if STRICT:
+        assert compared > 0, (
+            f"strict reference comparison matched 0 of {len(prompts)} prompts "
+            f"against {REFERENCE}"
+        )
+        assert not missing, (
+            f"strict reference comparison covered only {compared}/{len(prompts)} "
+            f"prompts; {len(missing)} have no reference entry:\n"
+            + "\n".join(f"  {p[:60]!r}" for p in missing[:3])
+        )
+    elif compared == 0:
         pytest.skip(
             "no reference prompt matches this run's salted prompts (expected "
             "unless DSV41_PD_RUN_SALT matches the reference run)"
@@ -429,3 +658,4 @@ def test_pd_matches_recorded_standalone_reference(prompts, round_metrics):
             f"  {p[:60]!r}\n    ref={w!r}\n    pd ={g!r}" for p, w, g in mismatches
         )
     )
+    print(f"\nreference comparison: {compared - len(mismatches)}/{compared} identical")

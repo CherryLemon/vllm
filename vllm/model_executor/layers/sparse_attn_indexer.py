@@ -48,6 +48,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+    get_row_request_ids,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
@@ -761,6 +762,10 @@ def sparse_attn_indexer(
                     sm90_block_table = sm90_block_table.repeat_interleave(
                         next_n, dim=0
                     )[:num_padded_tokens]
+                # Row -> request id map for the grouped kernel.  Never hand the
+                # group-6 map to DeepGEMM (a non-empty ``indices`` selects its
+                # SM100-only varlen branch); see ``get_row_request_ids``.
+                sm90_row_indices = get_row_request_ids(decode_metadata)
                 logits = sm90_fp4_paged_index_logits(
                     padded_q_quant_decode_tokens.reshape(
                         num_padded_tokens, *q_quant.shape[1:]
@@ -772,7 +777,7 @@ def sparse_attn_indexer(
                     sm90_block_table,
                     page_size=kv_cache_3d.shape[1],
                     width=max_model_len,
-                    row_indices=decode_metadata.indices,
+                    row_indices=sm90_row_indices,
                     query_group_size=getattr(
                         decode_metadata, "spec_group_size", 1
                     ),

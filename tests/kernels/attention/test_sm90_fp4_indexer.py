@@ -947,6 +947,301 @@ def test_group6_compact_mixed_candidates_falls_back(monkeypatch):
     assert torch.equal(grouped, per_row)
 
 
+def _group6_share_predicate(row_ids, first: int = 0) -> bool:
+    """Python replica of the kernel's on-device request-identity reduction.
+
+    ``_sm90_fp4_grouped_paged_index_logits_kernel`` reduces over ``PGROUP`` (8)
+    lanes while only ``GROUP`` (6) are real rows::
+
+        gmask = (offs < GROUP) & (rows < n_rows)
+        reqs  = tl.load(row_indices + rows, mask=gmask, other=0)
+        share = tl.sum(((reqs != req0) & gmask).to(tl.int32), 0) == 0
+
+    Keeping the predicate in Python is deliberate: the bug it pins (comparing
+    the two padding lanes, whose ``other`` is 0) is invisible in the kernel's
+    *output* -- a fallback group is numerically identical to a shared one, just
+    slower -- and an in-kernel counter perturbs unrelated kernel tests, so the
+    regression is pinned here, next to the GPU tests that pin the outputs.
+    """
+    group, pgroup = 6, 8
+    n_rows = len(row_ids)
+    req0 = row_ids[first]
+    for off in range(pgroup):
+        row = first + off
+        if off >= group or row >= n_rows:
+            continue  # the padding lane the kernel masks out
+        if row_ids[row] != req0:
+            return False
+    return True
+
+
+def test_group6_identity_predicate_ignores_reduction_padding_cpu():
+    """Non-zero request ids must share; the padded lanes must not veto."""
+    # A full group of one request shares whatever that request id is.
+    for req_id in (0, 1, 7, 31):
+        assert _group6_share_predicate([req_id] * 6), req_id
+    # The old predicate (no ``& gmask``) is False for every non-zero id: that
+    # is the regression, and it silently disabled K reuse batch-wide.
+    for req_id in (1, 7, 31):
+        old = sum(
+            1 for o in range(8) if ([req_id] * 6 + [0, 0])[o] != req_id
+        ) == 0
+        assert old is False, req_id
+    # A group straddling two requests must fall back.
+    assert not _group6_share_predicate([0, 0, 0, 7, 7, 7])
+    assert not _group6_share_predicate([7, 7, 7, 0, 0, 0])
+    # A partial last group still shares when every *real* row agrees: lanes
+    # past ``n_rows`` are masked, exactly like lanes past ``GROUP``.
+    assert _group6_share_predicate([5, 5, 5, 5])
+    assert _group6_share_predicate([5, 5, 5, 3]) is False
+    # The partial group is the *last* group of a longer batch.
+    assert _group6_share_predicate([0, 0, 0, 0, 0, 0, 5, 5, 5, 5], first=6)
+    assert _group6_share_predicate([0, 0, 0, 0, 0, 0, 5, 5, 5, 3], first=6) is False
+
+
+@requires_sm90
+@pytest.mark.parametrize("req_id", [0, 1, 7, 31])
+def test_group6_shares_full_groups_with_any_request_id(monkeypatch, req_id):
+    """A full group of one *non-zero* request id must still be bit-exact.
+
+    The reduction-padding bug made ``share`` False for every non-zero request
+    id, i.e. for essentially every group in a real batch: the kernel still
+    produced the right numbers (the fallback reloads K per row) but never
+    reused a tile.  Output equality cannot detect that -- see the CPU
+    predicate test above for the branch itself -- so this test pins that
+    non-zero ids keep working, and the timing comparison below is the
+    (non-gating) GPU-side evidence that reuse is the faster path.
+    """
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 12  # two full groups
+    n_vis = [300, 260, 220, 180, 120, 0, 305, 250, 205, 150, 90, 1]
+    (
+        fn,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    ) = _group6_dense_case(rows, n_vis, device)
+    row_indices = torch.full((rows,), req_id, device=device, dtype=torch.int32)
+
+    grouped = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    # The predicate that decides the branch, evaluated on the same inputs.
+    assert _group6_share_predicate([req_id] * 6)
+
+
+@requires_sm90
+def test_group6_multi_request_batch_shares_every_full_group(monkeypatch):
+    """Three single-request groups (ids 0/7/31) must all be bit-exact."""
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 18  # three full groups
+    (
+        fn,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    ) = _group6_dense_case(
+        rows,
+        [
+            300, 260, 220, 180, 120, 0,
+            305, 250, 205, 150, 90, 1,
+            240, 200, 160, 120, 80, 40,
+        ],
+        device,
+    )
+    row_indices = torch.tensor(
+        [0] * 6 + [7] * 6 + [31] * 6, device=device, dtype=torch.int32
+    )
+
+    grouped = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    ids = row_indices.tolist()
+    for start in (0, 6, 12):
+        assert _group6_share_predicate(ids, first=start)
+
+
+@requires_sm90
+def test_group6_mixed_request_group_falls_back_bit_exactly(monkeypatch):
+    """Interleaved request ids must keep the per-row fallback bit-exact."""
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows, heads, page_size = 12, 32, PAGE_SIZE
+    num_blocks = 32
+    width = 16 * page_size
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    block_table = torch.zeros((rows, 16), device=device, dtype=torch.int32)
+    block_table[:6, :16] = torch.arange(16, device=device, dtype=torch.int32)
+    block_table[6:, :16] = torch.arange(16, 32, device=device, dtype=torch.int32)
+    context_lens = torch.full((rows,), 8 * page_size, device=device, dtype=torch.int32)
+    # Every group mixes request 0 and request 7.
+    row_indices = torch.tensor(
+        [0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7], device=device, dtype=torch.int32
+    )
+
+    grouped = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    # Each group straddles requests 0 and 7 -> the fallback is required.
+    ids = row_indices.tolist()
+    for start in (0, 6):
+        assert not _group6_share_predicate(ids, first=start)
+
+
+@requires_sm90
+def test_group6_compact_skip_invalid_is_bit_exact(monkeypatch):
+    """The compact grouped path must gain the same all-invisible tile skip."""
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 6
+    (
+        fn,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        width,
+    ) = _group6_compact_case(rows, [100, 92, 77, 60, 33, 0], device)
+    # Second tile (block columns 8..15) is invisible for *every* row: either an
+    # invalid id or a logical position past the row's context length.
+    candidate_blocks[:, 8:] = torch.tensor(
+        [-1, 20, -1, 20, -1, 20, -1, 20], device=device, dtype=torch.int32
+    )
+    row_indices = torch.zeros(rows, device=device, dtype=torch.int32)
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES", False)
+    without = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=PAGE_SIZE,
+        write_candidates=False,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES", True)
+    skipped = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=PAGE_SIZE,
+        write_candidates=False,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    assert torch.equal(skipped, without)
+    # The oracle for the skip: tile 1 has no visible column for any row.
+    cand_row = candidate_blocks[0].detach().cpu()  # CPU oracle for a GPU tensor
+    cols = torch.arange(width)
+    block = cand_row[cols // cbs].to(torch.int64)
+    logical = block * cbs + (cols % cbs)
+    per_row_visible = [
+        int(((cols < width) & (block >= 0) & (logical < n)).sum())
+        for n in (100, 92, 77, 60, 33, 0)
+    ]
+    assert per_row_visible[0] > 0, "the shared tile must stay visible"
+    tile1 = cols >= (width // 2)
+    tile1_visible = [
+        int(((cols < width) & (block >= 0) & (logical < n) & tile1).sum())
+        for n in (100, 92, 77, 60, 33, 0)
+    ]
+    assert not any(tile1_visible), (
+        "the second tile must be invisible for every row, else the early exit "
+        f"cannot be the reason the two runs agree: {tile1_visible}"
+    )
+
+
 def test_group6_candidate_tile_guard_is_necessary():
     """CPU form of the compact group guard (the kernel needs a GPU).
 
@@ -1541,15 +1836,13 @@ def test_skip_invalid_tile_predicates_match_body_valid_cpu():
     for ks, ke in intervals:
         ws_valid = (cols < width) & (cols >= ks) & (cols < ke)
         starts = torch.arange(correct.numel()) * block_l
-        ws_skip = (starts >= ke) | (starts + block_l <= ks)
+        ws_skip = (ks >= ke) | (starts >= ke) | (starts + block_l <= ks)
         ideal = _tile_skip_from_valid(ws_valid, block_l)
         # Soundness: never skip a tile that still holds a visible column.
         assert not bool((ws_skip & ~ideal).any()), (ks, ke)
-        # For a non-empty interval the predicate is exact; an empty interval
-        # (``ks == ke``) inside a tile is conservatively *not* skipped, which
-        # still writes the right ``-inf`` through the body.
-        if ks < ke:
-            assert torch.equal(ws_skip, ideal), (ks, ke)
+        # Exact for every interval, including the empty one: ``ks >= ke`` skips
+        # every tile, which is what the body would write as all ``-inf``.
+        assert torch.equal(ws_skip, ideal), (ks, ke)
 
     # Workspace compact: visibility is ``ks + logical < ke``, not the column.
     ks, ke = 0, n_vis

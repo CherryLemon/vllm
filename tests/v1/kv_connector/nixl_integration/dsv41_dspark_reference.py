@@ -15,7 +15,7 @@ import json
 
 import openai
 
-from test_dsv41_dspark_pd import MAX_TOKENS, MODEL_NAME, PROMPTS
+from test_dsv41_dspark_pd import MAX_TOKENS, MODEL_NAME, PROMPTS, RUN_SALT
 
 
 def _complete(client, prompt: str, max_tokens: int) -> str:
@@ -40,6 +40,15 @@ def main() -> None:
         api_key="EMPTY", base_url=f"http://{args.host}:{args.port}/v1"
     )
     ref: dict[str, dict[str, str]] = {}
+    # Identity block for strict comparison: the acceptance test refuses a
+    # reference recorded for another model or run salt, because its tokens are
+    # then not comparable.  Not a prompt key (the prompts themselves can never
+    # be exactly `__meta__`).
+    ref["__meta__"] = {
+        "model": MODEL_NAME,
+        "run_salt": RUN_SALT,
+        "max_tokens": str(MAX_TOKENS),
+    }
     for prompt in PROMPTS:
         text = _complete(client, prompt, MAX_TOKENS)
         # The first token is the stable, transport-sensitive quantity the PD
@@ -51,7 +60,7 @@ def main() -> None:
         print(f"{prompt[:44]!r} -> {text[:50]!r} | first={first!r}")
     with open(args.out, "w") as fh:
         json.dump(ref, fh, indent=1)
-    print(f"wrote {len(ref)} prompts -> {args.out}")
+    print(f"wrote {len(ref) - 1} prompts -> {args.out}")
 
 
 if __name__ == "__main__":

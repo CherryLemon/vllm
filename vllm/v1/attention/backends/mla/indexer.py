@@ -620,6 +620,14 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
+    """Row -> request id map for the **DeepGEMM** ``paged_mqa_logits`` varlen
+    schedule.  DeepGEMM's ``indices`` branch is SM100-only, so this is only
+    ever non-``None`` on a builder that also opts into the varlen layout."""
+    row_request_ids: torch.Tensor | None = None
+    """Row -> request id map used **only** by the SM90 grouped FP4 indexer to
+    prove on device that ``spec_group_size`` consecutive flattened rows belong
+    to one request.  Kept separate from ``indices`` (see above): the SM90
+    dense/source builder publishes this and must never hand it to DeepGEMM."""
     spec_group_size: int = 1
     """1, or 6 on an admitted DSpark static target-verify step.  The SM90
     paged-FP4 kernel groups ``spec_group_size`` consecutive rows per CTA."""
@@ -858,6 +866,30 @@ def _sm90_dspark_group6_active(vllm_config: VllmConfig) -> bool:
         and spec.use_dspark()
         and spec.num_speculative_tokens == 5  # 1 + 5 = 6 verification rows
     )
+
+
+def get_row_request_ids(
+    decode_metadata: "DeepSeekV32IndexerDecodeMetadata",
+) -> torch.Tensor | None:
+    """Row -> request id map for the SM90 grouped FP4 indexer, or ``None``.
+
+    Two different builders publish the same information under two different
+    fields, and the distinction matters:
+
+    * ``row_request_ids`` -- the **dense flatten** builder's map.  It exists
+      only for the grouped kernel's on-device identity check.
+    * ``indices`` -- the **varlen** builder's map.  DeepGEMM also consumes it
+      as its varlen schedule argument, so it must never be fed a map that
+      belongs to the other field: a non-empty ``indices`` selects DeepGEMM's
+      SM100-only branch (``arch_major == 10``) and crashes on Hopper.
+
+    Returns ``None`` when neither field is set; callers then fall back to row
+    identity, which simply disables K reuse.
+    """
+    row_request_ids = getattr(decode_metadata, "row_request_ids", None)
+    if row_request_ids is not None:
+        return row_request_ids
+    return decode_metadata.indices
 
 
 def _use_flattening(vllm_config: VllmConfig) -> bool:
@@ -1566,12 +1598,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if self.sm90_group6 and not self.supports_varlen:
                 # The dense flatten path above has no row -> request map
                 # (``decode_indices`` is only published by the varlen branch).
-                # Group-6 needs it so the kernel can prove on device that a
+                # Group-6 needs one so the kernel can prove on device that a
                 # group of six flattened rows is one request.  The flattened
                 # row order is request-major (each request's ``decode_lens``
                 # tokens are contiguous), so the request of row ``t`` is the
                 # same binary search over ``query_start_loc`` the varlen kernel
                 # uses.  Cheap: one 256-wide block.
+                #
+                # This is NOT the DeepGEMM varlen `indices` map: keep it in a
+                # separate variable so it cannot reach
+                # ``get_paged_mqa_logits_metadata(indices=...)``, whose
+                # non-empty-``indices`` branch asserts ``arch_major == 10``.
                 from vllm.v1.attention.ops.metadata import (
                     _token_request_mapping_kernel,
                 )
@@ -1583,7 +1620,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     num_decode_tokens,
                     num_decode_tokens,
                 )
-                decode_indices = self.decode_indices_buffer[:num_decode_tokens]
+                group6_row_request_ids = self.decode_indices_buffer[:num_decode_tokens]
+            else:
+                group6_row_request_ids = None
 
             if self.compress_ratio > 1:
                 kernel_block_size = self.kernel_block_size
@@ -1646,6 +1685,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # keeps the exact condition it had: non-varlen builders always
             # satisfy `not self.supports_varlen`, and the SM100 varlen builder
             # satisfies the second term.
+            #
+            # ``decode_indices`` here is *only* the DeepGEMM varlen map (the
+            # SM90 group-6 request map lives in ``group6_row_request_ids`` and
+            # must not reach this call -- a non-empty ``indices`` would select
+            # DeepGEMM's SM100-only branch).
+            assert not self.supports_varlen or decode_indices is not None
             schedule_metadata = self.scheduler_metadata_buffer
             if (
                 current_platform.is_cuda()
@@ -1673,7 +1718,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and not use_native
                 and min_decode_len == max_decode_len == 6
                 and num_decode_tokens == num_decodes * 6
-                and decode_indices is not None
+                and group6_row_request_ids is not None
             ):
                 spec_group_size = 6
 
@@ -1684,6 +1729,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
                 indices=decode_indices,
+                row_request_ids=group6_row_request_ids,
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
                 decode_is_uniform=write_is_uniform,
