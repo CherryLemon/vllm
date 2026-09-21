@@ -4,6 +4,7 @@ import os
 
 import torch
 
+from vllm.model_executor.kernels.mhc import dispatch_stats as _mhc_stats
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -160,9 +161,15 @@ def mhc_pre_delayed_tilelang(
         next_pre_mix,
     )
     if num_tokens == 0:
+        if _mhc_stats.ENABLED:
+            _mhc_stats.record("pre_delayed", "empty", 0)
         return outputs
 
     use_deep_gemm = is_deep_gemm_supported()
+    if _mhc_stats.ENABLED:
+        _mhc_stats.record(
+            "pre_delayed", "deep_gemm" if use_deep_gemm else "tilelang", num_tokens
+        )
     n_splits = (
         compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
     )
@@ -377,6 +384,8 @@ def mhc_fused_post_pre_delayed_tilelang(
         device=residual.device,
     )
     if num_tokens == 0:
+        if _mhc_stats.ENABLED:
+            _mhc_stats.record("fused_post_pre_delayed", "empty", 0)
         return (
             torch.empty_like(residual),
             post.unsqueeze(-1),
@@ -387,6 +396,12 @@ def mhc_fused_post_pre_delayed_tilelang(
         )
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
+    if _mhc_stats.ENABLED:
+        _mhc_stats.record(
+            "fused_post_pre_delayed",
+            "fused" if fused_config is not None else "post_gemm",
+            num_tokens,
+        )
     if fused_config is not None:
         mixes, sqrsum, residual_cur = _MHC_FUSED_TILELANG_KERNEL(
             comb_res_mix,
@@ -822,9 +837,16 @@ def _mhc_post_split_h_supported(
 ) -> bool:
     """Shape/dtype/contiguity gate for the split-H post kernel.
 
-    Mirrors the SGLang guard (``deepseek_v4.py`` v12) for the subset vLLM
-    supports: hidden 5120, hc_mult 4, 1 <= tokens <= 240. Device/platform is
-    checked separately by :func:`has_sm90_mhc_split_h`.
+    This mirrors the *outer admission* condition of SGLang's TileLang mHC post
+    path (``deepseek_v4.py`` v12: ``1 <= x.shape[0] <= 240``), not the guard of
+    the SGLang TileLang kernel itself. SGLang only calls its
+    ``mhc_post_split_h_tilelang`` for ``65 <= x.shape[0] <= 240``; for
+    ``x.shape[0] <= 64`` it dispatches to a different small-M Triton kernel
+    (``mhc_post_split_h``) that vLLM has not ported. So for 1..64 vLLM runs
+    *this* TileLang kernel where SGLang runs a different one: the port widens
+    the SGLang TileLang guard down to 1, it does not reproduce SGLang's
+    dispatch decision. Device/platform is checked separately by
+    :func:`has_sm90_mhc_split_h`.
     """
     if x.dim() != 2:
         return False
@@ -856,7 +878,14 @@ def mhc_post_tilelang(
         _MHC_POST_TILELANG_KERNEL,
     )
 
-    if _mhc_post_split_h_supported(x, residual, post_layer_mix, comb_res_mix):
+    supported = _mhc_post_split_h_supported(x, residual, post_layer_mix, comb_res_mix)
+    if _mhc_stats.ENABLED:
+        _mhc_stats.record(
+            "post",
+            "split_h" if supported else "base",
+            x.shape[0] if x.dim() >= 1 else 0,
+        )
+    if supported:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _MHC_POST_SPLIT_H_TILELANG_KERNEL,
             MHC_SPLIT_H_BLOCK,
@@ -968,6 +997,12 @@ def mhc_fused_post_pre_tilelang(
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
+    if _mhc_stats.ENABLED:
+        _mhc_stats.record(
+            "fused_post_pre",
+            "fused" if fused_config is not None else "post_gemm",
+            num_tokens,
+        )
 
     post_mix_cur = torch.empty(
         num_tokens,

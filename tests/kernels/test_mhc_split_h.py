@@ -78,8 +78,9 @@ def test_guard_rejects_when_feature_disabled(monkeypatch):
     assert not mhc_tilelang._mhc_post_split_h_supported(x, residual, post, comb)
 
 
-@pytest.mark.parametrize("num_tokens", [0, 1, 240, 241])
+@pytest.mark.parametrize("num_tokens", [0, 1, 64, 65, 240, 241])
 def test_guard_token_bound(monkeypatch, num_tokens):
+    """Outer admission is 1..240, including SGLang's 64/65 boundary."""
     monkeypatch.setattr(mhc_tilelang, "has_sm90_mhc_split_h", lambda: True)
     x, residual, post, comb = _split_h_tensors(num_tokens, SPLIT_H_HIDDEN, device="cpu")
     expected = 1 <= num_tokens <= 240

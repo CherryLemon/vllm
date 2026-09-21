@@ -62,6 +62,8 @@ if TYPE_CHECKING:
     VLLM_SM90_FP4_INDEXER: bool = False
     VLLM_SM90_FP8_BLOCK32_STATIC: bool = False
     VLLM_SM90_MHC_SPLIT_H: bool = False
+    VLLM_MHC_DISPATCH_STATS: bool = False
+    VLLM_MHC_DISPATCH_STATS_INTERVAL: int = 1000
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1105,6 +1107,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM90 split-H mHC post TileLang kernel (WP C). Default off: the generic
     # mhc_post_tilelang kernel is used instead.
     "VLLM_SM90_MHC_SPLIT_H": lambda: bool(int(os.getenv("VLLM_SM90_MHC_SPLIT_H", "0"))),
+    # Host-side dispatch counters for the mHC TileLang paths. Default off: when
+    # off, the call sites only test a module-level bool. The counters never
+    # touch the device, so they are safe under CUDA graph capture.
+    "VLLM_MHC_DISPATCH_STATS": lambda: bool(
+        int(os.getenv("VLLM_MHC_DISPATCH_STATS", "0"))
+    ),
+    # Recorded dispatch calls between periodic mHC stats summaries (<= 0 logs
+    # only when a caller calls the snapshot/log API explicitly).
+    "VLLM_MHC_DISPATCH_STATS_INTERVAL": lambda: int(
+        os.getenv("VLLM_MHC_DISPATCH_STATS_INTERVAL", "1000")
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
