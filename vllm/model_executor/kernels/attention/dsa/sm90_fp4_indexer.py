@@ -29,8 +29,11 @@ importing it never changes any existing (family(100) / fp8) behaviour.
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
 
 # E4M3 max, kept for parity with the SGLang module's public constant.
 FP8_E4M3_MAX = 448.0
@@ -1139,6 +1142,17 @@ def sm90_fp4_paged_index_logits(
             f"row_indices has {row_indices.shape[0]} entries for {rows} rows"
         )
         grid = (triton.cdiv(rows, _GROUP6), triton.cdiv(width, _BLOCK_L))
+        # One line per process: this is the only place the group-6 K-reuse
+        # launch shape is observable from a serving log (the per-CTA branch
+        # codes need VLLM_SM90_FP4_GROUP6_STATS and an in-process reader).
+        logger.info_once(
+            "SM90 FP4 indexer: grouped (group-6) kernel launched "
+            "(rows=%d width=%d groups=%d tiles=%d).",
+            rows,
+            width,
+            grid[0],
+            grid[1],
+        )
         stats = _group6_stats_slab(logits.device, grid[0] * grid[1])
         _sm90_fp4_grouped_paged_index_logits_kernel[grid](
             q_values,
