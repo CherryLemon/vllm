@@ -59,6 +59,9 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SM90_FP4_INDEXER: bool = False
+    VLLM_SM90_FP8_BLOCK32_STATIC: bool = False
+    VLLM_SM90_MHC_SPLIT_H: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1088,6 +1091,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Opt-in kill switch for the SM90 (Hopper) MXFP4 sparse indexer. When set,
+    # family(90) GPUs may use the Triton SM90 indexer-logits kernels with the
+    # MXFP4 ('mxfp4') indexer K cache and the compact candidate-block path.
+    # Default off: SM100 keeps the DeepGEMM/DeepSelect path and family(90)
+    # keeps the FP8 indexer cache.
+    "VLLM_SM90_FP4_INDEXER": lambda: bool(int(os.getenv("VLLM_SM90_FP4_INDEXER", "0"))),
+    # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM (WP B). Default
+    # off: family(90) keeps the Marlin W8A16 fallback and SM100 is unchanged.
+    "VLLM_SM90_FP8_BLOCK32_STATIC": lambda: bool(
+        int(os.getenv("VLLM_SM90_FP8_BLOCK32_STATIC", "0"))
+    ),
+    # SM90 split-H mHC post TileLang kernel (WP C). Default off: the generic
+    # mhc_post_tilelang kernel is used instead.
+    "VLLM_SM90_MHC_SPLIT_H": lambda: bool(int(os.getenv("VLLM_SM90_MHC_SPLIT_H", "0"))),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by

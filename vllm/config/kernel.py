@@ -202,6 +202,7 @@ LinearBackend = Literal[
     "b12x",
     "marlin",
     "humming",
+    "mxfp8_sm90_static",
     "triton",
     "deep_gemm",
     "torch",
