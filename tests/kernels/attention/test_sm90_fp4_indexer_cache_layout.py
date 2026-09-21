@@ -401,8 +401,20 @@ def test_reader_consumes_writer_produced_cache(monkeypatch):
     q_values = _rand_q(rows, heads, device)
     q_scale = _valid_q_scale(rows, heads, device)
     weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
-    width = num_blocks * PAGE_SIZE
+    # Each request's *addressable* context is its own page-table row, not the
+    # whole physical pool.  ``block_table`` here is (rows, compress_ratio) =
+    # (2, 2), so a logical position >= 2 * PAGE_SIZE has no page-table entry:
+    # the kernel would gather ``block_table_ptr + row * stride + L // PAGE_SIZE``
+    # past the end of its row -- and past the 4-element tensor itself -- and then
+    # translate that garbage page id into a K-cache address.  That is exactly the
+    # illegal-access source this test used to feed the reader, so the visible
+    # width must be the row capacity.
+    width = block_table.shape[1] * PAGE_SIZE
     context_lens = torch.full((rows,), width, device=device, dtype=torch.int32)
+    assert int(context_lens.max().item()) <= block_table.shape[1] * PAGE_SIZE, (
+        "every visible logical position must have a page-table entry for its "
+        "request; wider visibility would read past the row"
+    )
 
     logits = sm90_fp4_paged_index_logits(
         q_values,

@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SM90_FP4_INDEXER: bool = False
     VLLM_SM90_FP4_GROUP6: bool = False
+    VLLM_SM90_FP4_GROUP6_STATS: bool = False
     VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES: bool = False
     VLLM_SM90_FP8_BLOCK32_STATIC: bool = False
     VLLM_SM90_MHC_SPLIT_H: bool = False
@@ -1110,6 +1111,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # failed guard falls back to the existing one-row-per-CTA kernel.  Default
     # off: the default launch shape and every non-admitted step are unchanged.
     "VLLM_SM90_FP4_GROUP6": lambda: bool(int(os.getenv("VLLM_SM90_FP4_GROUP6", "0"))),
+    # Debug-only branch observation for the group-6 K-reuse kernel: one uint8
+    # per (group, tile) CTA recording which branch it took (shared / per-row
+    # fallback / all-invisible tile skip).  Read back only by
+    # ``sm90_fp4_group6_stats()`` from tests; the model path never touches it and
+    # the store is constexpr-gated out when the flag is off.
+    "VLLM_SM90_FP4_GROUP6_STATS": lambda: bool(
+        int(os.getenv("VLLM_SM90_FP4_GROUP6_STATS", "0"))
+    ),
     # Opt-in early exit for the SM90 FP4 indexer-logits kernels: a grid tile
     # whose columns map to no visible position writes its ``-inf`` outputs and
     # returns before the Q load / K decode / tl.dot.  Skipped entirely when the

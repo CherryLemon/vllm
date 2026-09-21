@@ -1712,13 +1712,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # re-checks request identity on device; this only selects the
             # launch shape.  Default off: any admitted-step guard failing keeps
             # ``spec_group_size == 1`` and the per-row kernel.
+            #
+            # The admission check must use the *effective* row -> request map,
+            # not just the dense builder's field: the SM90 compact/sparse
+            # builder sets ``supports_varlen = True``, so its map is published
+            # as ``indices`` (the varlen builder's field) and
+            # ``group6_row_request_ids`` is None there.  Keying on the dense
+            # field alone silently disabled K reuse for the compact consumer --
+            # the very path this port is about.  ``decode_indices`` still goes
+            # to DeepGEMM on its own (see above).
+            effective_row_request_ids = (
+                group6_row_request_ids
+                if group6_row_request_ids is not None
+                else decode_indices
+            )
             spec_group_size = 1
             if (
                 self.sm90_group6
                 and not use_native
                 and min_decode_len == max_decode_len == 6
                 and num_decode_tokens == num_decodes * 6
-                and group6_row_request_ids is not None
+                and effective_row_request_ids is not None
             ):
                 spec_group_size = 6
 

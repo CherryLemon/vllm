@@ -176,3 +176,11 @@ def test_api_timeout_is_caught_before_connection_error():
     """
     assert issubclass(openai.APITimeoutError, openai.APIConnectionError)
     assert issubclass(openai.BadRequestError, openai.APIStatusError)
+
+
+def test_failed_transfer_on_a_compared_request_is_rejected():
+    """A recovered (retried) transfer must not pass the clean-path gate."""
+    pair = _pair("p0", "a", local="a", transfer=16.0)
+    pair["pd_failed"] = 240.0
+    with pytest.raises(AssertionError, match="recorded a \\*failed\\* NIXL transfer"):
+        pd_test.test_pd_first_token_matches_local_prefill([pair])

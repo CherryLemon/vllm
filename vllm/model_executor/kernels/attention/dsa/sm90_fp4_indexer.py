@@ -56,6 +56,86 @@ _NUM_WARPS = 4
 _GROUP6 = 6
 _GROUP6_PGROUP = 8
 
+# Debug-only branch observation for the grouped kernel
+# (``VLLM_SM90_FP4_GROUP6_STATS=1``).  It proves *which branch ran*, which a
+# pure output-equality test cannot: a fallback group is numerically identical
+# to a shared one but re-reads the K tile per row.
+#
+# One byte per (group, tile) CTA, written by that CTA alone -- no atomics, so
+# the write is race-free and costs one store.  A slot still holding
+# ``_GROUP6_STAT_UNSET`` after the launch means that CTA did not run.
+_GROUP6_STAT_SHARED = 0
+_GROUP6_STAT_FALLBACK = 1
+_GROUP6_STAT_INVALID_TILE = 2
+_GROUP6_STAT_UNSET = 255
+# Triton @jit bodies may only close over constexpr globals; see `_PAYLOAD_BYTES`.
+_TL_STAT_SHARED = tl.constexpr(_GROUP6_STAT_SHARED)
+_TL_STAT_FALLBACK = tl.constexpr(_GROUP6_STAT_FALLBACK)
+_TL_STAT_INVALID_TILE = tl.constexpr(_GROUP6_STAT_INVALID_TILE)
+# One slab per device, grown on demand and only while the flag is on, plus the
+# number of slots the *last* launch used (slots beyond it hold stale codes).
+_group6_stats_buffers: dict[torch.device, torch.Tensor] = {}
+_group6_stats_last_ctas: dict[torch.device, int] = {}
+
+
+def _group6_stats_slab(device: torch.device, num_ctas: int) -> torch.Tensor | None:
+    """Per-device ``uint8`` branch-code slab of ``num_ctas`` slots, or ``None``.
+
+    Refilled with the unset sentinel before every launch, so a reader only sees
+    the current launch's codes even though the buffer is reused.  This is the
+    same mechanism that, before the writer->reader test's page-table width was
+    corrected, made that test's out-of-row page-table gather fatal: an extra
+    small allocation moved the garbage page ids into unmapped memory.  See
+    ``reports/review_fixes_round4.md`` for the 2x2 that pinned that down.
+    """
+    if not envs.VLLM_SM90_FP4_GROUP6_STATS:
+        return None
+    buf = _group6_stats_buffers.get(device)
+    if buf is None or buf.numel() < num_ctas:
+        buf = torch.empty(max(num_ctas, 1024), dtype=torch.uint8, device=device)
+        _group6_stats_buffers[device] = buf
+    buf[:num_ctas].fill_(_GROUP6_STAT_UNSET)
+    _group6_stats_last_ctas[device] = num_ctas
+    return buf[:num_ctas]
+
+
+def reset_group6_stats(device: torch.device | None = None) -> None:
+    """Mark every group-6 observation slot unset (debug helper)."""
+    for dev, buf in _group6_stats_buffers.items():
+        if device is None or dev == device:
+            buf.fill_(_GROUP6_STAT_UNSET)
+    for dev in list(_group6_stats_last_ctas):
+        if device is None or dev == device:
+            _group6_stats_last_ctas[dev] = 0
+
+
+def sm90_fp4_group6_stats(device: torch.device | None = None) -> dict[str, int]:
+    """Read the group-6 branch codes of the **last** grouped launch (debug).
+
+    Returns ``{"shared": n, "fallback": n, "invalid_tile": n}`` plus
+    ``"enabled"``, counted from the per-CTA slots of the most recent launch.
+    Only meaningful with ``VLLM_SM90_FP4_GROUP6_STATS=1``; with the flag off the
+    kernel writes nothing.  Never called from the model path.
+    """
+    totals = {
+        "enabled": int(bool(envs.VLLM_SM90_FP4_GROUP6_STATS)),
+        "shared": 0,
+        "fallback": 0,
+        "invalid_tile": 0,
+    }
+    for dev, buf in _group6_stats_buffers.items():
+        if device is not None and dev != device:
+            continue
+        num_ctas = _group6_stats_last_ctas.get(dev, 0)
+        if num_ctas == 0:
+            continue
+        counts = torch.bincount(buf[:num_ctas].detach().cpu(), minlength=3)
+        totals["shared"] += int(counts[_GROUP6_STAT_SHARED])
+        totals["fallback"] += int(counts[_GROUP6_STAT_FALLBACK])
+        totals["invalid_tile"] += int(counts[_GROUP6_STAT_INVALID_TILE])
+    return totals
+
+
 def has_sm90_fp4_indexer() -> bool:
     """True on family(90) CUDA when ``VLLM_SM90_FP4_INDEXER`` is enabled.
 
@@ -532,6 +612,7 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     stride_bt,
     stride_cb,
     stride_out,
+    stats_ptr,
     H: tl.constexpr,
     HALF_D: tl.constexpr,
     BLOCK_L: tl.constexpr,
@@ -540,9 +621,11 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
     SKIP_INVALID: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
 ):
     first = tl.program_id(0) * GROUP
     lb = tl.program_id(1)
+    stat_slot = stats_ptr + tl.program_id(0) * tl.num_programs(1) + lb
     offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
     offs = tl.arange(0, PGROUP)
     rows = first + offs
@@ -558,6 +641,8 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     # is compile-time and must not force the runtime comparison into a Tensor.
     if not USE_CANDIDATES:  # noqa: SIM102
         if lb * BLOCK_L >= tl.minimum(max_n_vis, width):
+            if COLLECT_STATS:
+                tl.store(stat_slot, _TL_STAT_INVALID_TILE)
             for j in tl.range(0, GROUP, loop_unroll_factor=1):
                 b = first + j
                 if b < n_rows:
@@ -592,6 +677,8 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
                     (offs_l < width) & (ids >= 0) & (logical < n_vis_b)
                 ).to(tl.int32)
         if tl.sum(any_visible, 0) == 0:
+            if COLLECT_STATS:
+                tl.store(stat_slot, _TL_STAT_INVALID_TILE)
             for j in tl.range(0, GROUP, loop_unroll_factor=1):
                 b = first + j
                 if b < n_rows:
@@ -638,6 +725,8 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
                 share = share & (tl.sum((other_ids != lead).to(tl.int32), 0) == 0)
 
     if share:
+        if COLLECT_STATS:
+            tl.store(stat_slot, _TL_STAT_SHARED)
         k_low, k_high, logical, col_valid = _sm90_fp4_group_load_keys(
             cache_ptr,
             block_table_ptr,
@@ -683,6 +772,8 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     else:
         # Mixed-request / partial / differing-candidate group: reload per row,
         # i.e. the existing one-row-per-CTA behaviour, never wrong.
+        if COLLECT_STATS:
+            tl.store(stat_slot, _TL_STAT_FALLBACK)
         for j in tl.range(0, GROUP, loop_unroll_factor=1):
             b = first + j
             if b < n_rows:
@@ -1048,6 +1139,7 @@ def sm90_fp4_paged_index_logits(
             f"row_indices has {row_indices.shape[0]} entries for {rows} rows"
         )
         grid = (triton.cdiv(rows, _GROUP6), triton.cdiv(width, _BLOCK_L))
+        stats = _group6_stats_slab(logits.device, grid[0] * grid[1])
         _sm90_fp4_grouped_paged_index_logits_kernel[grid](
             q_values,
             q_scale_bytes,
@@ -1070,6 +1162,7 @@ def sm90_fp4_paged_index_logits(
             block_table.stride(0),
             stride_cb,
             logits.stride(0),
+            logits if stats is None else stats,
             H=heads,
             HALF_D=INDEX_HEAD_DIM // 2,
             BLOCK_L=_BLOCK_L,
@@ -1078,6 +1171,7 @@ def sm90_fp4_paged_index_logits(
             USE_CANDIDATES=use_candidates,
             CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
             SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
+            COLLECT_STATS=stats is not None,
             num_warps=_NUM_WARPS,
         )
         # ``use_grouped`` requires ``not write_candidates``, so the grouped

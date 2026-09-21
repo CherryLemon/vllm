@@ -37,6 +37,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _sm90_compact_group6_config(max_model_len: int = 1024):
+    """The same config plus the sparse-logits (compact consumer) opt-in."""
+    cfg = _sm90_group6_config(max_model_len)
+    cfg.attention_config.indexer_sparse_logits = True
+    cfg.model_config.hf_config.update(
+        {
+            "candidate_block_size": 8,
+            "candidate_topk_blocks": 2048,
+            "index_topk": 512,
+        }
+    )
+    return cfg
+
+
 def _sm90_group6_config(max_model_len: int = 1024):
     """A VllmConfig that satisfies the real group-6 admission predicates.
 
@@ -63,29 +77,19 @@ def _sm90_group6_config(max_model_len: int = 1024):
     return cfg
 
 
-def _dense_group6_case(num_requests: int = 2, decode_len: int = 6):
-    """Two requests x six verify rows, dense (non-varlen) SM90 layout."""
-    device = torch.device("cuda")
-    kv_cache_spec = MLAAttentionSpec(
+def _kv_cache_spec() -> MLAAttentionSpec:
+    return MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
         tokens_per_state=4,
     )
-    vllm_config = _sm90_group6_config()
-    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
-    block_table_width = get_block_table_width(
-        max_num_blocks, kv_cache_spec.block_size
-    )
-    builder = DeepseekV32IndexerMetadataBuilder(
-        kv_cache_spec=kv_cache_spec,
-        layer_names=["dummy"],
-        vllm_config=vllm_config,
-        device=device,
-        block_table_width=block_table_width,
-    )
 
+
+def _block6_common(num_requests: int = 2, decode_len: int = 6):
+    """``num_requests`` x six flattened verify rows, request-major."""
+    device = torch.device("cuda")
     query_lens = [decode_len] * num_requests
     num_tokens = sum(query_lens)
     query_start_loc = torch.zeros(num_requests + 1, dtype=torch.int32, device=device)
@@ -111,7 +115,26 @@ def _dense_group6_case(num_requests: int = 2, decode_len: int = 6):
         slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device=device),
         causal=True,
     )
-    return builder, common
+    return common
+
+
+def _dense_group6_case(num_requests: int = 2, decode_len: int = 6):
+    """Two requests x six verify rows, dense (non-varlen) SM90 layout."""
+    device = torch.device("cuda")
+    kv_cache_spec = _kv_cache_spec()
+    vllm_config = _sm90_group6_config()
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
+    block_table_width = get_block_table_width(
+        max_num_blocks, kv_cache_spec.block_size
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=device,
+        block_table_width=block_table_width,
+    )
+    return builder, _block6_common(num_requests, decode_len)
 
 
 def test_group6_builder_keeps_deepgemm_indices_empty(monkeypatch):
@@ -211,3 +234,63 @@ def test_group6_builder_leaves_varlen_map_on_the_deepgemm_field(monkeypatch):
     if has_deep_gemm():
         assert len(calls) == 1
         assert calls[0]["kwargs"].get("indices") is not None, calls
+
+def test_compact_builder_admits_group6_on_a_block5_step(monkeypatch):
+    """The compact (varlen) builder must also get ``spec_group_size == 6``.
+
+    Regression: splitting the group-6 map out of the DeepGEMM field made the
+    admission check look at the *dense* field only.  The SM90 compact builder
+    sets ``supports_varlen = True``, so its row -> request map is published as
+    ``indices`` and ``row_request_ids`` stays None -- which silently kept
+    ``spec_group_size == 1`` for the consumer path this port exists for.  The
+    admission check now uses the effective map, and this test pins it on the
+    real ``DeepseekV41SparseIndexerMetadataBuilder``.
+    """
+    from vllm.v1.attention.backends.mla.sparse_indexer import (
+        DeepseekV41SparseIndexerMetadataBuilder,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_INDEXER", True)
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+
+    device = torch.device("cuda")
+    kv_cache_spec = _kv_cache_spec()
+    vllm_config = _sm90_compact_group6_config()
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
+    block_table_width = get_block_table_width(
+        max_num_blocks, kv_cache_spec.block_size
+    )
+    builder = DeepseekV41SparseIndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=device,
+        block_table_width=block_table_width,
+    )
+    assert builder.supports_varlen is True, "the SM90 compact builder is varlen"
+    assert builder.sm90_group6 is True
+
+    calls: list[dict] = []
+
+    def _recorder(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return torch.zeros((builder.num_sms, 2), dtype=torch.int32, device="cuda")
+
+    monkeypatch.setattr(indexer_mod, "get_paged_mqa_logits_metadata", _recorder)
+    md = builder.build(common_prefix_len=0, common_attn_metadata=_block6_common())
+
+    decode = md.decode
+    assert decode is not None
+    # The group-6 launch shape is admitted...
+    assert decode.spec_group_size == 6, (
+        "the compact consumer did not admit the group-6 launch shape: "
+        f"spec_group_size={decode.spec_group_size}"
+    )
+    # ... through the varlen map, while the dense field stays empty...
+    assert decode.row_request_ids is None
+    assert decode.indices is not None
+    # ... and the grouped kernel's accessor resolves to that map.
+    assert torch.equal(get_row_request_ids(decode), decode.indices)
+    # DeepGEMM's SM100-only varlen branch must still never be reached from
+    # Hopper: the varlen DeepGEMM condition is false here, so no call at all.
+    assert not calls, calls

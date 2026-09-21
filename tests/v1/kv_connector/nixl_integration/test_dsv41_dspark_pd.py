@@ -198,8 +198,15 @@ def delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]
     return {k: after.get(k, 0.0) - before.get(k, 0.0) for k in before}
 
 
-def _client(base_url: str) -> openai.OpenAI:
-    return openai.OpenAI(api_key="EMPTY", base_url=base_url)
+def _client(base_url: str, max_retries: int | None = None) -> openai.OpenAI:
+    """OpenAI client; ``max_retries=0`` makes one attempt for one timeout.
+
+    The SDK retries timeouts twice by default, so a 60 s timeout can take ~180 s
+    and leave one parked request per attempt on the server.  The negative
+    control sets 0 so its single request maps to a single engine-side request.
+    """
+    kwargs = {} if max_retries is None else {"max_retries": max_retries}
+    return openai.OpenAI(api_key="EMPTY", base_url=base_url, **kwargs)
 
 
 def _complete_resp(
@@ -208,12 +215,13 @@ def _complete_resp(
     max_tokens: int = MAX_TOKENS,
     extra_body: dict | None = None,
     timeout: float | None = None,
+    max_retries: int | None = None,
 ):
     body = {"add_special_tokens": False}
     if extra_body:
         body.update(extra_body)
     kwargs = {} if timeout is None else {"timeout": timeout}
-    return _client(base_url).completions.create(
+    return _client(base_url, max_retries=max_retries).completions.create(
         model=MODEL_NAME,
         prompt=prompt,
         max_tokens=max_tokens,
@@ -280,6 +288,34 @@ def reset_decode_prefix_cache() -> bool:
         time.sleep(1 + attempt)
     print(f"prefix-cache reset did not succeed: {last_error}")
     return False
+
+
+def connector_reports_pending_remote_kv() -> bool:
+    """Ask the engine whether a request is still waiting for remote KV.
+
+    That is *connector-level* evidence that the negative control reached the
+    pull path: the scheduler refuses a prefix-cache reset for exactly that
+    reason.  Used instead of a "it took longer than N seconds" threshold, which
+    a plain queueing delay would also satisfy.
+    """
+    url = (
+        f"http://{DECODE_HOST}:{DECODE_PORT}/reset_prefix_cache"
+        "?reset_running_requests=true&reset_external=true"
+    )
+    try:
+        body = json.loads(
+            urlopen(Request(url, method="POST"), timeout=60).read().decode()
+        )
+    except HTTPError as exc:
+        if exc.code < 500:
+            return False
+        with contextlib.suppress(Exception):
+            return "waiting for remote KV transfer" in exc.read().decode()
+        return False
+    except Exception:  # noqa: BLE001 - an unreachable engine is not evidence
+        return False
+    # A successful reset means nothing is parked any more.
+    return not body.get("success", False)
 
 
 def decode_is_healthy() -> bool:
@@ -481,6 +517,17 @@ def test_pd_first_token_matches_local_prefill(first_token_ab):
             "entry. Check that /reset_prefix_cache?reset_external=true really "
             "clears the connector cache."
         )
+    failed_transfers = [p for p in first_token_ab if p["pd_failed"] > 0]
+    assert not failed_transfers, (
+        f"{len(failed_transfers)}/{len(first_token_ab)} compared PD requests "
+        "recorded a *failed* NIXL transfer while still answering. This gate is "
+        "for the clean path: a retry that recovered the transfer must not be "
+        "accepted here (test fault tolerance separately).\n"
+        + "\n".join(
+            f"  {p['prompt'][:50]!r} failures={p['pd_failed']:.0f}"
+            for p in failed_transfers
+        )
+    )
     no_transfer = [p for p in first_token_ab if p["pd_transfer"] <= 0]
     assert not no_transfer, (
         f"{len(no_transfer)}/{len(first_token_ab)} compared PD requests recorded "
@@ -650,6 +697,10 @@ def test_negative_control_unreachable_producer(round_metrics):
             max_tokens=4,
             extra_body={"kv_transfer_params": bogus},
             timeout=60.0,
+            # One attempt = one engine-side request.  With the SDK's default
+            # two retries a "60 s" control actually made three requests and
+            # parked three; that also made the measured 181.5 s unreadable.
+            max_retries=0,
         )
         answered = resp.choices[0].text
     except openai.BadRequestError as exc:
@@ -686,18 +737,21 @@ def test_negative_control_unreachable_producer(round_metrics):
     after = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
     failed = delta(before, after)
     failure_evidence = failed[NIXL_FAILED_XFER] + failed[NIXL_FAILED_NOTIFY]
-    parked = elapsed >= 30.0
+    still_pulling = connector_reports_pending_remote_kv()
     print(
         f"negative control: no answer after {elapsed:.1f}s "
         f"({type(failure).__name__ if failure else 'no exception'}), "
-        f"transfer failures +{failure_evidence:.0f}"
+        f"transfer failures +{failure_evidence:.0f}, "
+        f"engine still reports a pending remote KV wait: {still_pulling}"
     )
-    assert failure_evidence > 0 or parked, (
-        "the negative control did not answer, but there is no evidence it "
-        "reached the connector: the failure counters stayed flat and the "
-        f"request returned in {elapsed:.1f}s. A fast non-answer looks like a "
-        "rejected/no-op request, not like a stalled remote pull.\n"
-        f"  {type(failure).__name__ if failure else 'no exception'}"
+    assert failure_evidence > 0 or still_pulling, (
+        "the negative control did not answer, but there is no connector-level "
+        "evidence that it reached the pull path: the failure counters stayed "
+        "flat and the engine does not report a request waiting for remote KV. "
+        "A plain queueing delay (or a silently dropped request) satisfies "
+        '"it did not answer" without proving anything about remote prefill.\n'
+        f"  exception: {type(failure).__name__ if failure else 'none'}, "
+        f"elapsed {elapsed:.1f}s, failures +{failure_evidence:.0f}"
     )
     assert decode_is_healthy(), (
         "the decode instance stopped serving after the negative control; the "

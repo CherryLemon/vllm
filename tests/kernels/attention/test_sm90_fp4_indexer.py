@@ -947,6 +947,12 @@ def test_group6_compact_mixed_candidates_falls_back(monkeypatch):
     assert torch.equal(grouped, per_row)
 
 
+def _enable_group6_stats(monkeypatch, sm90_mod):
+    """Turn on the kernel's branch observation and clear the slab."""
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6_STATS", True)
+    sm90_mod.reset_group6_stats()
+
+
 def _group6_share_predicate(row_ids, first: int = 0) -> bool:
     """Python replica of the kernel's on-device request-identity reduction.
 
@@ -1007,12 +1013,14 @@ def test_group6_shares_full_groups_with_any_request_id(monkeypatch, req_id):
     The reduction-padding bug made ``share`` False for every non-zero request
     id, i.e. for essentially every group in a real batch: the kernel still
     produced the right numbers (the fallback reloads K per row) but never
-    reused a tile.  Output equality cannot detect that -- see the CPU
-    predicate test above for the branch itself -- so this test pins that
-    non-zero ids keep working, and the timing comparison below is the
-    (non-gating) GPU-side evidence that reuse is the faster path.
+    reused a tile.  Output equality cannot detect that, which is why this test
+    asserts both the CPU predicate and the kernel's own branch code: every full
+    group of a non-zero id must be reported *shared*, never a fallback.
     """
+    import vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer as sm90_mod
+
     monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    _enable_group6_stats(monkeypatch, sm90_mod)
     device = "cuda"
     rows = 12  # two full groups
     n_vis = [300, 260, 220, 180, 120, 0, 305, 250, 205, 150, 90, 1]
@@ -1053,12 +1061,26 @@ def test_group6_shares_full_groups_with_any_request_id(monkeypatch, req_id):
     assert torch.equal(grouped, per_row)
     # The predicate that decides the branch, evaluated on the same inputs.
     assert _group6_share_predicate([req_id] * 6)
+    # ... and the branch the kernel actually took: with the padding lanes
+    # masked, every full group of a single non-zero request id must be *shared*.
+    # Only the kernel can show that; the output is identical either way.
+    stats = sm90_mod.sm90_fp4_group6_stats()
+    assert stats["enabled"] == 1
+    assert stats["shared"] > 0, f"no K reuse for request id {req_id}: {stats}"
+    assert stats["fallback"] == 0, stats
 
 
 @requires_sm90
 def test_group6_multi_request_batch_shares_every_full_group(monkeypatch):
-    """Three single-request groups (ids 0/7/31) must all be bit-exact."""
+    """Three single-request groups (ids 0/7/31): bit-exact *and* all shared.
+
+    The kernel must report no fallback CTA for the whole launch -- the point of
+    the masking fix is that non-zero request ids still reuse one K tile.
+    """
+    import vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer as sm90_mod
+
     monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    _enable_group6_stats(monkeypatch, sm90_mod)
     device = "cuda"
     rows = 18  # three full groups
     (
@@ -1109,14 +1131,20 @@ def test_group6_multi_request_batch_shares_every_full_group(monkeypatch):
     ids = row_indices.tolist()
     for start in (0, 6, 12):
         assert _group6_share_predicate(ids, first=start)
+    stats = sm90_mod.sm90_fp4_group6_stats()
+    assert stats["shared"] > 0
+    assert stats["fallback"] == 0, stats
 
 
 @requires_sm90
 def test_group6_mixed_request_group_falls_back_bit_exactly(monkeypatch):
     """Interleaved request ids must keep the per-row fallback bit-exact."""
+    import vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer as sm90_mod
     from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
         sm90_fp4_paged_index_logits,
     )
+
+    _enable_group6_stats(monkeypatch, sm90_mod)
 
     monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
     device = "cuda"
@@ -1163,6 +1191,10 @@ def test_group6_mixed_request_group_falls_back_bit_exactly(monkeypatch):
     ids = row_indices.tolist()
     for start in (0, 6):
         assert not _group6_share_predicate(ids, first=start)
+    # Observed on device: every CTA of this launch took the per-row fallback.
+    stats = sm90_mod.sm90_fp4_group6_stats()
+    assert stats["fallback"] > 0, stats
+    assert stats["shared"] == 0, stats
 
 
 @requires_sm90
