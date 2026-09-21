@@ -17,6 +17,7 @@ reference file.
 
 import json
 
+import openai
 import pytest
 import test_dsv41_dspark_pd as pd_test
 
@@ -164,3 +165,14 @@ def test_first_token_ab_reports_mismatch(monkeypatch):
         pd_test.test_pd_first_token_matches_local_prefill(
             [_pair("p0", "a", local="z", transfer=3.0)]
         )
+
+def test_api_timeout_is_caught_before_connection_error():
+    """``APITimeoutError`` subclasses ``APIConnectionError`` in the SDK.
+
+    The negative control must treat a timeout as "parked waiting for KV" (the
+    expected outcome) and a connection error as "the decode service is down"
+    (a hard failure).  Catching the base class first inverted those in the
+    first live run, so the ordering is pinned here.
+    """
+    assert issubclass(openai.APITimeoutError, openai.APIConnectionError)
+    assert issubclass(openai.BadRequestError, openai.APIStatusError)

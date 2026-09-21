@@ -78,8 +78,14 @@ Environment variables (set by ``dsv41_dspark_pd_sm90.sh``):
                               (default 1).  Only for debugging a server without
                               VLLM_SERVER_DEV_MODE=1; disabling it weakens the
                               local control back to the old shared-cache case.
+    DSV41_SKIP_NEGATIVE_CONTROL - 1 skips the unreachable-producer control
+                              (default 0).  It parks a request the engine
+                              cannot abort, which blocks prefix-cache resets
+                              until the decode instance is restarted; the A/B
+                              must run before it (test order) for that reason.
 """
 
+import contextlib
 import json
 import os
 import time
@@ -102,6 +108,10 @@ STRICT = os.environ.get("DSV41_STRICT_REFERENCE", "0") == "1"
 # independent; it is on by default and only turned off to debug a server that
 # was started without VLLM_SERVER_DEV_MODE=1.
 COLD_RESET = os.environ.get("DSV41_COLD_RESET", "1") == "1"
+# The negative control parks a request on an unreachable producer, which the
+# engine cannot abort (see the test's docstring).  Skip it when re-running only
+# the A/B against an instance that already has one parked.
+SKIP_NEGATIVE_CONTROL = os.environ.get("DSV41_SKIP_NEGATIVE_CONTROL", "0") == "1"
 
 # Mirrors the model's SWA bounded-replay window; see the module docstring.
 SWA_REPLAY_TOKENS = int(os.environ.get("DSV41_SWA_REPLAY_TOKENS", "128"))
@@ -254,8 +264,13 @@ def reset_decode_prefix_cache() -> bool:
                 )
             if exc.code >= 500:
                 # The scheduler raises while blocks are still held (e.g. a
-                # request parked on a remote transfer); retry, then fail loudly.
-                last_error = f"HTTP {exc.code}"
+                # request parked on a remote transfer); retry, then fail loudly
+                # with the server's own message.
+                with contextlib.suppress(Exception):
+                    # Best-effort diagnostics: the server's own message.
+                    last_error = f"HTTP {exc.code} {exc.read().decode()[:240]}"
+                if not last_error:
+                    last_error = f"HTTP {exc.code}"
                 time.sleep(1 + attempt)
                 continue
             raise
@@ -328,7 +343,12 @@ def first_token_ab(prompts):
         if COLD_RESET:
             assert reset_decode_prefix_cache(), (
                 "the decode instance refused to reset its prefix cache "
-                "(reset_external=true); the local control cannot be trusted"
+                "(reset_external=true), so the local control cannot be trusted "
+                "to be independent of the PD request. The usual cause is a "
+                "request still parked waiting for remote KV -- vLLM cannot "
+                "reset the cache in that state ('not supported yet'). Restart "
+                "the decode instance, or run this file with "
+                "DSV41_SKIP_NEGATIVE_CONTROL=1 so no such request is created."
             )
         hits_before = scrape(DECODE_METRICS_URL, (PREFIX_QUERIES, PREFIX_HITS))
         local_first = _complete_resp(DECODE_BASE_URL, prompt, max_tokens=1).choices[
@@ -397,16 +417,16 @@ def test_dspark_spec_decode_ran_this_round(round_metrics):
 
 
 def test_kv_transfer_is_actually_used(round_metrics):
-    """Positive + negative evidence that decode consumed remote KV.
+    """Positive evidence that decode consumed remote KV.
 
-    Positive: the decode instance must report at least one completed transfer
-    in this round.  A zero delta means the requests were served by a local
-    recompute -- which produces perfectly correct text, so no output check can
-    catch it and the PD configuration is untested.
+    The decode instance must report at least one completed transfer in this
+    round.  A zero delta means the requests were served by a local recompute --
+    which produces perfectly correct text, so no output check can catch it and
+    the PD configuration is untested.
 
-    Negative: a ``do_remote_prefill`` request whose producer is unreachable must
-    not answer.  Note this control is only meaningful above the replay window,
-    where the scheduler is actually willing to pull.
+    The negative control (an unreachable producer) lives in its own test at the
+    end of the file: it deliberately leaves a request parked on a remote
+    transfer, which would make a later prefix-cache reset fail.
     """
     d = round_metrics["delta"]
     n_prompt = min(round_metrics["prompt_tokens"])
@@ -430,94 +450,6 @@ def test_kv_transfer_is_actually_used(round_metrics):
         "instance (RUN_SALT) and above the replay window."
     )
     print(f"\nKV transfer this round: {transfer_evidence:.0f} transfer(s)")
-
-    novel = (
-        f"[pd-negative-control-{time.time_ns()}] {_FILLER} "
-        "The chemical symbol for gold is"
-    )
-    bogus = {
-        "do_remote_decode": False,
-        "do_remote_prefill": True,
-        "remote_engine_id": "deadbeef-0000-0000-0000-000000000000",
-        "remote_request_id": "cmpl-negative-control",
-        "remote_host": "10.255.255.1",  # TEST-NET-3 style black hole
-        "remote_port": 5999,
-        "remote_block_ids": list(range(40)),
-        "remote_num_tokens": 60,
-        "tp_size": 8,
-        "dcp_size": 1,
-        "pp_size": 1,
-        "transfer_mode": "pull",
-    }
-    # Sample the failure counters across the negative control only, so a
-    # "transfer failed" claim cannot be inherited from an unrelated step.
-    before = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
-    started = time.time()
-    answered = None
-    failure: Exception | None = None
-    try:
-        resp = _complete_resp(
-            DECODE_BASE_URL,
-            novel,
-            max_tokens=4,
-            extra_body={"kv_transfer_params": bogus},
-            timeout=60.0,
-        )
-        answered = resp.choices[0].text
-    except openai.BadRequestError as exc:
-        # A rejected request never reached the connector: it proves nothing
-        # about remote prefill, and accepting it was the old bug.
-        pytest.fail(
-            "the negative control was rejected by request validation before it "
-            f"could reach the connector (HTTP {exc.status_code}). Build the "
-            "bogus params from a metadata block the server already accepted, "
-            "changing only the producer address."
-        )
-    except openai.APIConnectionError as exc:
-        pytest.fail(
-            "the negative control could not reach the *decode* service at all "
-            f"({type(exc).__name__}), so no request was ever made"
-        )
-    except Exception as exc:  # noqa: BLE001 - timeout/524 is the expected outcome
-        failure = exc
-    elapsed = time.time() - started
-
-    if answered is not None:
-        pytest.fail(
-            "the decode instance answered a do_remote_prefill request whose "
-            f"producer (10.255.255.1:5999) is unreachable, in {elapsed:.1f}s: "
-            f"{answered[:40]!r}. That is only possible by recomputing the "
-            "prefill locally, so remote prefill is not in effect."
-        )
-
-    after = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
-    failed = delta(before, after)
-    failure_evidence = failed[NIXL_FAILED_XFER] + failed[NIXL_FAILED_NOTIFY]
-    parked = elapsed >= 30.0
-    print(
-        f"negative control: no answer after {elapsed:.1f}s "
-        f"({type(failure).__name__ if failure else 'no exception'}), "
-        f"transfer failures +{failure_evidence:.0f}"
-    )
-    assert failure_evidence > 0 or parked, (
-        "the negative control did not answer, but there is no evidence it "
-        "reached the connector: the failure counters stayed flat and the "
-        f"request returned in {elapsed:.1f}s. A fast non-answer looks like a "
-        "rejected/no-op request, not like a stalled remote pull.\n"
-        f"  {type(failure).__name__ if failure else 'no exception'}"
-    )
-    assert decode_is_healthy(), (
-        "the decode instance stopped serving after the negative control; the "
-        "unreachable producer must not wedge the engine"
-    )
-    # The engine must also still *schedule*: a stuck waiting queue would leave
-    # /health green.  This probe is a plain local request.
-    probe = _complete_resp(
-        DECODE_BASE_URL,
-        f"[pd-negative-control-probe-{time.time_ns()}] hello",
-        max_tokens=1,
-    )
-    assert probe.choices, "the decode instance scheduled nothing after the control"
 
 
 # ---------------------------------------------------------------------------
@@ -659,3 +591,125 @@ def test_pd_matches_recorded_standalone_reference(first_token_ab):
         )
     )
     print(f"\nreference comparison: {compared - len(mismatches)}/{compared} identical")
+
+
+# ---------------------------------------------------------------------------
+# 2b. negative control: an unreachable producer must not answer (LAST)
+# ---------------------------------------------------------------------------
+# Deliberately the final test: the request it parks is still waiting for
+# remote KV when the client gives up, so the decode instance holds its
+# blocks for a while and a prefix-cache reset would be refused (HTTP 500).
+# Running it after the cold A/B keeps the two independent.
+
+
+def test_negative_control_unreachable_producer(round_metrics):
+    """A do_remote_prefill request to an unreachable producer must not answer.
+
+    And the non-answer must be *connector-level*: a rejected request (HTTP
+    400) or an unreachable decode service proves nothing, so both fail here.
+    A non-answer is accepted only with evidence -- a moved NIXL failure
+    counter, or a request parked for at least 30 s -- and the decode instance
+    must still be healthy and still schedule afterwards.
+
+    Known vLLM limitation: the parked request cannot be aborted while it waits
+    for a remote transfer, so it keeps the decode instance's blocks referenced
+    and *a later prefix-cache reset will be refused* until the engine restarts.
+    Set ``DSV41_SKIP_NEGATIVE_CONTROL=1`` to skip it when re-running only the
+    cold A/B against an instance that had one parked.
+    """
+    if SKIP_NEGATIVE_CONTROL:
+        pytest.skip("DSV41_SKIP_NEGATIVE_CONTROL=1")
+    novel = (
+        f"[pd-negative-control-{time.time_ns()}] {_FILLER} "
+        "The chemical symbol for gold is"
+    )
+    bogus = {
+        "do_remote_decode": False,
+        "do_remote_prefill": True,
+        "remote_engine_id": "deadbeef-0000-0000-0000-000000000000",
+        "remote_request_id": "cmpl-negative-control",
+        "remote_host": "10.255.255.1",  # TEST-NET-3 style black hole
+        "remote_port": 5999,
+        "remote_block_ids": list(range(40)),
+        "remote_num_tokens": 60,
+        "tp_size": 8,
+        "dcp_size": 1,
+        "pp_size": 1,
+        "transfer_mode": "pull",
+    }
+    # Sample the failure counters across the negative control only, so a
+    # "transfer failed" claim cannot be inherited from an unrelated step.
+    before = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
+    started = time.time()
+    answered = None
+    failure: Exception | None = None
+    try:
+        resp = _complete_resp(
+            DECODE_BASE_URL,
+            novel,
+            max_tokens=4,
+            extra_body={"kv_transfer_params": bogus},
+            timeout=60.0,
+        )
+        answered = resp.choices[0].text
+    except openai.BadRequestError as exc:
+        # A rejected request never reached the connector: it proves nothing
+        # about remote prefill, and accepting it was the old bug.
+        pytest.fail(
+            "the negative control was rejected by request validation before it "
+            f"could reach the connector (HTTP {exc.status_code}). Build the "
+            "bogus params from a metadata block the server already accepted, "
+            "changing only the producer address."
+        )
+    except openai.APITimeoutError as exc:
+        # The expected outcome: the request is parked waiting for KV that never
+        # arrives.  This must be caught before APIConnectionError, because
+        # ``APITimeoutError`` subclasses it in the OpenAI SDK.
+        failure = exc
+    except openai.APIConnectionError as exc:
+        pytest.fail(
+            "the negative control could not reach the *decode* service at all "
+            f"({type(exc).__name__}), so no request was ever made"
+        )
+    except Exception as exc:  # noqa: BLE001 - a 5xx from the connector is fine
+        failure = exc
+    elapsed = time.time() - started
+
+    if answered is not None:
+        pytest.fail(
+            "the decode instance answered a do_remote_prefill request whose "
+            f"producer (10.255.255.1:5999) is unreachable, in {elapsed:.1f}s: "
+            f"{answered[:40]!r}. That is only possible by recomputing the "
+            "prefill locally, so remote prefill is not in effect."
+        )
+
+    after = scrape(DECODE_METRICS_URL, (NIXL_FAILED_XFER, NIXL_FAILED_NOTIFY))
+    failed = delta(before, after)
+    failure_evidence = failed[NIXL_FAILED_XFER] + failed[NIXL_FAILED_NOTIFY]
+    parked = elapsed >= 30.0
+    print(
+        f"negative control: no answer after {elapsed:.1f}s "
+        f"({type(failure).__name__ if failure else 'no exception'}), "
+        f"transfer failures +{failure_evidence:.0f}"
+    )
+    assert failure_evidence > 0 or parked, (
+        "the negative control did not answer, but there is no evidence it "
+        "reached the connector: the failure counters stayed flat and the "
+        f"request returned in {elapsed:.1f}s. A fast non-answer looks like a "
+        "rejected/no-op request, not like a stalled remote pull.\n"
+        f"  {type(failure).__name__ if failure else 'no exception'}"
+    )
+    assert decode_is_healthy(), (
+        "the decode instance stopped serving after the negative control; the "
+        "unreachable producer must not wedge the engine"
+    )
+    # The engine must also still *schedule*: a stuck waiting queue would leave
+    # /health green.  This probe is a plain local request.
+    probe = _complete_resp(
+        DECODE_BASE_URL,
+        f"[pd-negative-control-probe-{time.time_ns()}] hello",
+        max_tokens=1,
+    )
+    assert probe.choices, "the decode instance scheduled nothing after the control"
+
+
