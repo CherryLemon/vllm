@@ -432,6 +432,25 @@ def reset_decode_prefix_cache() -> bool:
     return False
 
 
+def reset_decode_prefix_cache_with_retry(timeout: float = 30.0) -> bool:
+    """Reset the decode cache, tolerating a pull that is still settling.
+
+    The reset is refused while any request still waits for remote KV, and a
+    request can be *answered* a moment before its connector bookkeeping is
+    drained (measured: the very first round after a router-driven burst).  A
+    bounded retry keeps the A/B precondition honest without weakening it: a
+    genuinely parked request -- the NIXL failure mode -- still fails, just
+    after ``timeout`` seconds instead of immediately.
+    """
+    deadline = time.time() + timeout
+    while True:
+        if reset_decode_prefix_cache():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(2)
+
+
 def connector_reports_pending_remote_kv() -> bool:
     """Ask the engine whether a request is still waiting for remote KV.
 
@@ -526,11 +545,11 @@ def first_token_ab(prompts):
         local_hits = None
         local_first = None
         if COLD_RESET:
-            assert reset_decode_prefix_cache(), (
+            assert reset_decode_prefix_cache_with_retry(), (
                 "the decode instance refused to reset its prefix cache "
-                "(reset_external=true), so the local control cannot be trusted "
-                "to be independent of the PD request. The usual cause is a "
-                "request still parked waiting for remote KV -- vLLM cannot "
+                "(reset_external=true) for 30 s, so the local control cannot be "
+                "trusted to be independent of the PD request. The usual cause "
+                "is a request still parked waiting for remote KV -- vLLM cannot "
                 "reset the cache in that state ('not supported yet'). Restart "
                 "the decode instance, or run this file with "
                 "DSV41_SKIP_NEGATIVE_CONTROL=1 so no such request is created."
@@ -543,10 +562,10 @@ def first_token_ab(prompts):
         local_hits = hits_after[PREFIX_HITS] - hits_before[PREFIX_HITS]
 
         if COLD_RESET:
-            assert reset_decode_prefix_cache(), (
+            assert reset_decode_prefix_cache_with_retry(), (
                 "the decode instance refused the second (pre-PD) prefix-cache "
-                "reset, so the PD request may be served from the local cache "
-                "entry the control just created"
+                "reset for 30 s, so the PD request may be served from the local "
+                "cache entry the control just created"
             )
         before = scrape(DECODE_METRICS_URL, TRANSFER_METRICS)
         pd_first = _complete_resp(PROXY_BASE_URL, prompt, max_tokens=1).choices[0].text

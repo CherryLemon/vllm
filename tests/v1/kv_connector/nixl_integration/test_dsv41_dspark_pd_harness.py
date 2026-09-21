@@ -36,16 +36,36 @@ def harness_config(**env_overrides: str) -> dict[str, str]:
     env.pop("DECODE_HOST", None)
     env.pop("ENABLE_GRAPHS", None)
     env.pop("BUCKETS", None)
+    env.pop("MAX_MODEL_LEN", None)
     # Connector selection must come from the test, not from the caller's shell:
     # a leaked KV_CONNECTOR would silently turn the "default" tests into
-    # Mooncake tests.
+    # Mooncake tests.  The same goes for every knob whose *default* is the
+    # thing under test (per-role limits, the opt-in SM90 kernels).
     for leaked in (
         "KV_CONNECTOR",
         "WITH_NVIDIA_PEERMEM",
         "MOONCAKE_ABORT_REQUEST_TIMEOUT",
         "MOONCAKE_DEVICE_NAME",
+        "ROUTER",
+        "ROUTING",
+        "ROUTER_TIMEOUT_S",
         "PREFILL_MOONCAKE_BOOTSTRAP_PORT",
         "DECODE_MOONCAKE_BOOTSTRAP_PORT",
+        "PREFILL_PREFIX_CACHING",
+        "DECODE_PREFIX_CACHING",
+        "PREFILL_MAX_NUM_SEQS",
+        "DECODE_MAX_NUM_SEQS",
+        "PREFILL_MAX_NUM_BATCHED_TOKENS",
+        "DECODE_MAX_NUM_BATCHED_TOKENS",
+        "MAX_NUM_SEQS",
+        "MAX_NUM_BATCHED_TOKENS",
+        "PREFILL_SPEC_CONFIG",
+        "DECODE_SPEC_CONFIG",
+        "VLLM_SM90_FP4_INDEXER",
+        "VLLM_SM90_FP8_BLOCK32_STATIC",
+        "VLLM_SM90_MHC_SPLIT_H",
+        "VLLM_SM90_FP4_GROUP6",
+        "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES",
     ):
         env.pop(leaked, None)
     env.update(env_overrides)
@@ -191,6 +211,52 @@ def test_mooncake_rdma_rail_goes_into_the_extra_config():
     args = args_of(cfg, "PREFILL_CMD")
     kv = json.loads(args[args.index("--kv-transfer-config") + 1])
     assert kv["kv_connector_extra_config"] == {}
+
+
+def test_router_switch_builds_both_routers():
+    """`toy` stays the default; `dsv41` gets the connector and every instance.
+
+    The dsv41 router is connector-aware and concurrent, the toy proxy is
+    neither, so which one is running has to be visible in the resolved argv
+    rather than implied by the file.
+    """
+    args = args_of(harness_config(), "PROXY_CMD")
+    # argv[0] is the interpreter; the script is what identifies the router.
+    assert args[1].endswith("toy_proxy_server.py")
+    assert "dsv41_pd_router.py" not in " ".join(args)
+
+    args = args_of(
+        harness_config(
+            ROUTER="dsv41",
+            KV_CONNECTOR="MooncakeConnector",
+            PREFILL_HOSTS="10.8.2.13,10.8.2.14",
+            DECODE_HOSTS="10.8.2.9,10.8.2.10",
+            ROUTING="round-robin",
+        ),
+        "PROXY_CMD",
+    )
+    assert args[1].endswith("dsv41_pd_router.py")
+    assert args[args.index("--kv-connector") + 1] == "MooncakeConnector"
+    assert args[args.index("--routing") + 1] == "round-robin"
+    # One --prefill/--decode per instance, with the per-role ports.
+    prefills = [args[i + 1] for i, a in enumerate(args) if a == "--prefill"]
+    decodes = [args[i + 1] for i, a in enumerate(args) if a == "--decode"]
+    assert prefills == ["http://10.8.2.13:8200", "http://10.8.2.14:8200"]
+    assert decodes == ["http://10.8.2.9:8300", "http://10.8.2.10:8300"]
+
+    cfg = harness_config(ROUTER="dsv41")
+    assert cfg["ROUTING"] == "prefix-affinity"  # the default routing mode
+
+
+def test_unknown_router_fails_instead_of_starting_the_other_one():
+    env = dict(os.environ)
+    env["ROLE"] = "print-config"
+    env["ROUTER"] = "not-a-router"
+    proc = subprocess.run(
+        ["bash", str(HARNESS)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "unknown ROUTER" in proc.stderr
 
 
 def test_unknown_connector_fails_instead_of_starting_a_mismatched_pair():
@@ -409,3 +475,141 @@ def test_parallel_sizes_must_fit_the_node():
     assert proc.returncode != 0
     combined = proc.stdout + proc.stderr
     assert "FAIL: TP" in combined and "this harness has 8" in combined, combined
+
+
+def test_max_model_len_is_the_total_context_not_the_prompt_budget():
+    """The flag has to reach both roles unchanged.
+
+    131072 input plus 8192 output needs at least 139264: a launch that reuses
+    the prompt length as the context limit measures a truncated request.
+    """
+    cfg = harness_config(MAX_MODEL_LEN="147456")
+    assert cfg["MAX_MODEL_LEN"] == "147456"
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        args = args_of(cfg, key)
+        assert args[args.index("--max-model-len") + 1] == "147456"
+
+
+def test_prefix_caching_is_per_role():
+    """The reference deployment caches on P and not on D, in one launch.
+
+    Both directions are passed explicitly, so what the engines resolved is
+    visible in argv instead of inherited from a default.
+    """
+    cfg = harness_config()
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        assert "--enable-prefix-caching" in args_of(cfg, key)
+
+    cfg = harness_config(PREFILL_PREFIX_CACHING="1", DECODE_PREFIX_CACHING="0")
+    prefill = args_of(cfg, "PREFILL_CMD")
+    decode = args_of(cfg, "DECODE_CMD")
+    assert "--enable-prefix-caching" in prefill
+    assert "--no-enable-prefix-caching" not in prefill
+    assert "--no-enable-prefix-caching" in decode
+    assert "--enable-prefix-caching" not in decode
+    # The role split must not leak into anything else.
+    assert prefill.count("--max-num-seqs") == 1 and decode.count("--max-num-seqs") == 1
+
+
+def test_a_bad_prefix_caching_value_fails_loudly():
+    env = {**os.environ, "ROLE": "print-config", "DECODE_PREFIX_CACHING": "yes"}
+    proc = subprocess.run(
+        ["bash", str(HARNESS)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "prefix caching must be 1 or 0" in proc.stderr
+
+
+def test_scheduler_limits_are_per_role_and_per_engine():
+    """Client concurrency / DECODE_DP has to fit in the engine's limit.
+
+    With decode-side DP every rank has its own scheduler, so a global limit
+    would either starve the ranks (too low) or let the router queue behind a
+    full engine (too high).
+    """
+    cfg = harness_config(DECODE_TP="2", DECODE_DP="4", DECODE_MAX_NUM_SEQS="24")
+    decode = args_of(cfg, "DECODE_CMD")
+    assert decode[decode.index("--max-num-seqs") + 1] == "24"
+    # P keeps the global default (16) when only the decode limit is set.
+    prefill = args_of(cfg, "PREFILL_CMD")
+    assert prefill[prefill.index("--max-num-seqs") + 1] == "16"
+
+    cfg = harness_config(
+        MAX_NUM_SEQS="12",
+        PREFILL_MAX_NUM_BATCHED_TOKENS="4096",
+        DECODE_MAX_NUM_BATCHED_TOKENS="16384",
+    )
+    # The bare variable stays the shared default ...
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        args = args_of(cfg, key)
+        assert args[args.index("--max-num-seqs") + 1] == "12"
+    # ... and the token budget is independently settable per role.
+    prefill = args_of(cfg, "PREFILL_CMD")
+    decode = args_of(cfg, "DECODE_CMD")
+    assert prefill[prefill.index("--max-num-batched-tokens") + 1] == "4096"
+    assert decode[decode.index("--max-num-batched-tokens") + 1] == "16384"
+
+
+def test_speculative_decoding_can_be_turned_off_by_omitting_the_flag():
+    """`none` must remove --speculative-config, not set a zero.
+
+    num_speculative_tokens has to be > 0, so there is no "off" JSON value; a
+    harness that always passes the flag cannot express the no-speculation
+    control at all.
+    """
+    cfg = harness_config(PREFILL_SPEC_CONFIG="none", DECODE_SPEC_CONFIG="none")
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        assert "--speculative-config" not in args_of(cfg, key)
+    assert cfg["PREFILL_SPEC_ARGS_COUNT"] == "0"
+    assert cfg["DECODE_SPEC_ARGS_COUNT"] == "0"
+
+    # Roles are independent: an ablation that only turns off one side is a
+    # different experiment (and usually an incompatible layout) from one that
+    # turns off both.
+    cfg = harness_config(DECODE_SPEC_CONFIG="none")
+    assert "--speculative-config" in args_of(cfg, "PREFILL_CMD")
+    assert "--speculative-config" not in args_of(cfg, "DECODE_CMD")
+
+    # A real JSON config still goes through as one argument.
+    cfg = harness_config(
+        DECODE_SPEC_CONFIG='{"method":"dspark","num_speculative_tokens":3}'
+    )
+    decode = args_of(cfg, "DECODE_CMD")
+    assert json.loads(decode[decode.index("--speculative-config") + 1]) == {
+        "method": "dspark",
+        "num_speculative_tokens": 3,
+    }
+
+
+def test_opt_in_sm90_flags_are_explicit_in_the_service_environment():
+    """An A/B that cannot show which value the worker saw is not an A/B.
+
+    These two keep the library default (off) but are exported anyway, so the
+    value is decided by this harness rather than by an ambient shell that may
+    not reach the container at all.
+    """
+    cfg = harness_config()
+    assert cfg["VLLM_SM90_FP4_GROUP6"] == "0"
+    assert cfg["VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"] == "0"
+    # The always-on three keep their ported-path default.
+    assert cfg["VLLM_SM90_FP4_INDEXER"] == "1"
+    assert cfg["VLLM_SM90_FP8_BLOCK32_STATIC"] == "1"
+    assert cfg["VLLM_SM90_MHC_SPLIT_H"] == "1"
+
+    cfg = harness_config(
+        VLLM_SM90_FP4_GROUP6="1", VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES="1"
+    )
+    assert cfg["VLLM_SM90_FP4_GROUP6"] == "1"
+    assert cfg["VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"] == "1"
+
+
+def test_router_leg_timeout_is_stated_not_implicit():
+    args = args_of(harness_config(ROUTER="dsv41"), "PROXY_CMD")
+    assert args[args.index("--request-timeout-s") + 1] == "600"
+
+    cfg = harness_config(ROUTER="dsv41", ROUTER_TIMEOUT_S="1800")
+    args = args_of(cfg, "PROXY_CMD")
+    assert args[args.index("--request-timeout-s") + 1] == "1800"
+    assert cfg["ROUTER_TIMEOUT_S"] == "1800"
+    # The toy proxy has no such flag; setting the variable must not add one.
+    assert "--request-timeout-s" not in args_of(harness_config(), "PROXY_CMD")

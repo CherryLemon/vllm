@@ -45,12 +45,39 @@
 #                         forbids heterogeneous block sizes).  DP ranks bind
 #                         side-channel ports base_port + dp_rank, so keep the two
 #                         port ranges disjoint (5600 for P, 5610 for D).
-#   MAX_MODEL_LEN       - (default 32768)
+#   MAX_MODEL_LEN       - (default 32768).  This is the *total* context, input
+#                         plus output: a 131072-token prompt that may generate
+#                         8192 tokens needs at least 139264.
 #   GPU_MEMORY_UTILIZATION - (default 0.88)
+#   MAX_NUM_SEQS / MAX_NUM_BATCHED_TOKENS - (defaults 16 / 8192) both roles
+#   PREFILL_MAX_NUM_SEQS / DECODE_MAX_NUM_SEQS - per-role scheduler limits
+#                         (default: MAX_NUM_SEQS).  They are *per engine*: with
+#                         decode-side DP the client concurrency has to be
+#                         divided by DECODE_DP before comparing.
+#   PREFILL_MAX_NUM_BATCHED_TOKENS / DECODE_MAX_NUM_BATCHED_TOKENS - same, for
+#                         the token budget
+#   PREFILL_PREFIX_CACHING / DECODE_PREFIX_CACHING - 1/0 per role (both 1).
+#                         The reference deployment keeps the prefiller's cache
+#                         on and the decoder's off.
 #   PREFILL_PORT        - (default 8200)
 #   DECODE_PORT         - (default 8300)
 #   PROXY_PORT          - (default 8192)
 #   NIXL_SIDE_CHANNEL_HOST - address the NIXL side channel binds to
+#   ROUTER              - toy (default) or dsv41.  `toy` is the test
+#                         scaffolding proxy in this directory; `dsv41` is the
+#                         port's own router
+#                         (examples/disaggregated/disaggregated_serving/
+#                         dsv41_pd_router.py), which is connector-aware,
+#                         genuinely concurrent (the toy proxy serialises per
+#                         request, so concurrency numbers taken through it
+#                         measure the proxy) and can route by prompt affinity.
+#                         Both are interchangeable for this harness: it only
+#                         needs /v1/completions and /healthcheck.
+#   ROUTING             - prefix-affinity (default) or round-robin; ROUTER=dsv41
+#                         only.
+#   ROUTER_TIMEOUT_S    - (default 600) per-leg HTTP timeout of the dsv41
+#                         router.  Long-context legs need a stated value rather
+#                         than an implicit one.
 #   KV_CONNECTOR        - NixlConnector (default) or MooncakeConnector.  Both
 #                         implement the same kv_role/do_remote_* protocol and
 #                         carry KV over their own side channel, so the toy proxy
@@ -81,7 +108,19 @@
 #                         Set it explicitly when the proxy runs on a third
 #                         machine: decode /metrics is not on the proxy.
 #   ATTENTION_CONFIG    - (default mxfp4 indexer + sparse logits)
-#   PREFILL_SPEC_CONFIG / DECODE_SPEC_CONFIG - speculative configs
+#   PREFILL_SPEC_CONFIG / DECODE_SPEC_CONFIG - speculative configs; the literal
+#                         value `none` (or empty) omits --speculative-config
+#                         entirely, which is the only legal way to turn DSpark
+#                         off (num_speculative_tokens must be > 0).  Turning it
+#                         off changes the KV layout, so a PD ablation must do it
+#                         on both sides and re-check the graph shapes.
+#   VLLM_SM90_FP4_INDEXER / VLLM_SM90_FP8_BLOCK32_STATIC / VLLM_SM90_MHC_SPLIT_H
+#                       - (default 1) the ported SM90 kernels; exported into the
+#                         service environment, not just the caller's shell.
+#   VLLM_SM90_FP4_GROUP6 / VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES
+#                       - (default 0 = library default) the two kernels that are
+#                         only entered on specific shapes; an A/B has to set
+#                         them here so the worker's own environment shows it.
 #   ENABLE_GRAPHS       - 1 keeps CUDA graphs on (default 0 = --enforce-eager)
 #   BUCKETS             - capture sizes used when ENABLE_GRAPHS=1
 #   VLLM_SERVER_DEV_MODE - (default 1) exposes /reset_prefix_cache, which the
@@ -102,10 +141,27 @@ PREFILL_TP="${PREFILL_TP:-$TP}"
 DECODE_TP="${DECODE_TP:-$TP}"
 PREFILL_DP="${PREFILL_DP:-1}"
 DECODE_DP="${DECODE_DP:-1}"
+# The context limit covers input *and* output, so a 131072-token prompt needs
+# at least 131072 + the output budget.  Anything smaller silently truncates the
+# request (the API server rejects it, or worse, a shorter prompt is measured).
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.88}"
+# Scheduling limits are per *engine* and per role: with decode-side DP every
+# rank has its own scheduler, so a global client concurrency of N needs
+# N / DECODE_DP slots on each engine (plus admission headroom, or the router
+# just queues).  The bare variables stay as both roles' default.
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-$MAX_NUM_SEQS}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-$MAX_NUM_SEQS}"
+PREFILL_MAX_NUM_BATCHED_TOKENS="${PREFILL_MAX_NUM_BATCHED_TOKENS:-$MAX_NUM_BATCHED_TOKENS}"
+DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-$MAX_NUM_BATCHED_TOKENS}"
+# Prefix caching per role.  The deployment this harness is measured against
+# keeps it on for the prefiller (one shared prefix, reused across requests) and
+# off for the decoder (every request gets its own KV), so the two roles must be
+# independently settable.  1 = on, 0 = off; any other value is a config error.
+PREFILL_PREFIX_CACHING="${PREFILL_PREFIX_CACHING:-1}"
+DECODE_PREFIX_CACHING="${DECODE_PREFIX_CACHING:-1}"
 # Empty = let the attention backend pick the block size it requires.
 BLOCK_SIZE="${BLOCK_SIZE:-}"
 
@@ -120,6 +176,14 @@ NIXL_SIDE_CHANNEL_HOST="${NIXL_SIDE_CHANNEL_HOST:-127.0.0.1}"
 # KV connector under test.  The harness is otherwise connector-agnostic: roles,
 # speculative config and the proxy protocol are identical.
 KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
+# Which proxy/router sits in front of the pair (see the header).
+ROUTER="${ROUTER:-toy}"
+ROUTING="${ROUTING:-prefix-affinity}"
+# Per-leg HTTP timeout of the dsv41 router.  A 131k-token prefill plus a long
+# generation can legitimately take minutes, but the timeout has to be a stated
+# number: a client-side failure that is really "the leg took longer than the
+# default" must not be counted as a slow success.
+ROUTER_TIMEOUT_S="${ROUTER_TIMEOUT_S:-600}"
 # Mooncake's bootstrap HTTP server binds a port per *instance*; two instances on
 # one host (ROLE=all) would collide on the library default 8998.
 PREFILL_MOONCAKE_BOOTSTRAP_PORT="${PREFILL_MOONCAKE_BOOTSTRAP_PORT:-8998}"
@@ -149,6 +213,12 @@ ATTENTION_CONFIG="${ATTENTION_CONFIG:-$DEFAULT_ATTENTION_CONFIG}"
 # DSpark block5: the decode instance drafts 5 tokens per round; the prefill
 # instance only needs a legal (smaller) speculative config, matching the
 # upstream PD+SD harness convention.
+#
+# "none" (or an empty value) means *no* speculative decoding: the flag is
+# omitted.  It cannot be expressed by a config value, because
+# num_speculative_tokens must be > 0.  The draft config is also part of the KV
+# layout (the DSpark layers have their own caches), so a PD ablation must turn
+# it off on both sides and re-check graphs and cache compatibility.
 PREFILL_SPEC_CONFIG="${PREFILL_SPEC_CONFIG:-$DEFAULT_PREFILL_SPEC_CONFIG}"
 DECODE_SPEC_CONFIG="${DECODE_SPEC_CONFIG:-$DEFAULT_DECODE_SPEC_CONFIG}"
 
@@ -162,6 +232,13 @@ GIT_ROOT="${GIT_ROOT:-$(cd -- "${SCRIPT_DIR}/../../../.." && pwd -P)}"
 export VLLM_SM90_FP4_INDEXER="${VLLM_SM90_FP4_INDEXER:-1}"
 export VLLM_SM90_FP8_BLOCK32_STATIC="${VLLM_SM90_FP8_BLOCK32_STATIC:-1}"
 export VLLM_SM90_MHC_SPLIT_H="${VLLM_SM90_MHC_SPLIT_H:-1}"
+# These two keep the library default (off) unless the caller opts in.  They are
+# exported *explicitly* rather than left to the ambient shell: a flag that only
+# exists in the calling shell never reaches the container, and an A/B that
+# cannot prove which value the worker saw is not an A/B.  Both are echoed by
+# ROLE=print-config.
+export VLLM_SM90_FP4_GROUP6="${VLLM_SM90_FP4_GROUP6:-0}"
+export VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES="${VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES:-0}"
 
 # The acceptance test resets the decode instance's prefix cache between the PD
 # request and the local control (`POST /reset_prefix_cache?reset_external=true`)
@@ -272,21 +349,51 @@ wait_for_http() {
 }
 
 # Common serve flags, as an array so JSON values and paths with spaces survive
-# shell word splitting.
+# shell word splitting.  `common_args <role>`: the scheduling limits and the
+# prefix-caching switch are per role, everything else is shared.
 COMMON_ARGS=()
 GRAPH_ARGS=()
+SPEC_ARGS=()
 common_args() {
+  local role="$1" seqs batched prefix_caching
+  case "$role" in
+    prefill)
+      seqs="$PREFILL_MAX_NUM_SEQS"
+      batched="$PREFILL_MAX_NUM_BATCHED_TOKENS"
+      prefix_caching="$PREFILL_PREFIX_CACHING"
+      ;;
+    decode)
+      seqs="$DECODE_MAX_NUM_SEQS"
+      batched="$DECODE_MAX_NUM_BATCHED_TOKENS"
+      prefix_caching="$DECODE_PREFIX_CACHING"
+      ;;
+    *)
+      log "FAIL: common_args needs a role (prefill|decode), got '${role}'"
+      return 1
+      ;;
+  esac
   COMMON_ARGS=(
     --model "$MODEL_PATH"
     --served-model-name "$SERVED_NAME"
     --enable-expert-parallel
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
-    --max-num-seqs "$MAX_NUM_SEQS"
-    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
+    --max-num-seqs "$seqs"
+    --max-num-batched-tokens "$batched"
     --attention-config "$ATTENTION_CONFIG"
   )
   [ -n "$BLOCK_SIZE" ] && COMMON_ARGS+=(--block-size "$BLOCK_SIZE")
+
+  # Both directions are passed explicitly so the resolved value is in argv and
+  # not implied by a default that upstream may change.
+  case "$prefix_caching" in
+    1) COMMON_ARGS+=(--enable-prefix-caching) ;;
+    0) COMMON_ARGS+=(--no-enable-prefix-caching) ;;
+    *)
+      log "FAIL: prefix caching must be 1 or 0 for role ${role}, got '${prefix_caching}'"
+      return 1
+      ;;
+  esac
 
   if [ "$ENABLE_GRAPHS" = "1" ]; then
     # DSpark: target verifies 1 + dspark_block_size rows per request, draft
@@ -303,6 +410,18 @@ common_args() {
     # flags left vLLM free to pick its own defaults and capture anyway.
     GRAPH_ARGS=(--enforce-eager)
   fi
+}
+
+# Speculative decoding is opt-*out* here: there is no legal JSON value that
+# means "off" (num_speculative_tokens must be > 0), so "none" has to remove the
+# flag instead of setting a zero.
+spec_config_args() {
+  local spec="$1"
+  SPEC_ARGS=()
+  case "$spec" in
+    "" | none | None) return 0 ;;
+  esac
+  SPEC_ARGS=(--speculative-config "$spec")
 }
 
 # Each service command is built into the ``CMD`` array (one element per argv
@@ -386,53 +505,84 @@ connector_env() {
 }
 
 prefill_cmd() {
-  common_args
+  common_args prefill
   parallel_args "$PREFILL_TP" "$PREFILL_DP"
   connector_env prefill
+  spec_config_args "$PREFILL_SPEC_CONFIG"
   CMD=(
     env
     "${CONNECTOR_ENV[@]}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
-    "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}"
+    "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}" "${SPEC_ARGS[@]}"
     --port "$PREFILL_PORT"
     --kv-transfer-config "$(kv_transfer_config kv_producer)"
-    --speculative-config "$PREFILL_SPEC_CONFIG"
   )
-  log "prefill instance on port ${PREFILL_PORT} (TP=$PREFILL_TP DP=$PREFILL_DP graphs=$ENABLE_GRAPHS connector=$KV_CONNECTOR)"
+  log "prefill instance on port ${PREFILL_PORT} (TP=$PREFILL_TP DP=$PREFILL_DP graphs=$ENABLE_GRAPHS connector=$KV_CONNECTOR prefix-caching=$PREFILL_PREFIX_CACHING max-num-seqs=$PREFILL_MAX_NUM_SEQS spec=${PREFILL_SPEC_CONFIG:-none})"
 }
 
 decode_cmd() {
-  common_args
+  common_args decode
   parallel_args "$DECODE_TP" "$DECODE_DP"
   connector_env decode
+  spec_config_args "$DECODE_SPEC_CONFIG"
   CMD=(
     env
     "${CONNECTOR_ENV[@]}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
-    "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}"
+    "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}" "${SPEC_ARGS[@]}"
     --port "$DECODE_PORT"
     --kv-transfer-config "$(kv_transfer_config kv_consumer)"
-    --speculative-config "$DECODE_SPEC_CONFIG"
   )
-  log "decode instance on port ${DECODE_PORT} (TP=$DECODE_TP DP=$DECODE_DP graphs=$ENABLE_GRAPHS connector=$KV_CONNECTOR)"
+  log "decode instance on port ${DECODE_PORT} (TP=$DECODE_TP DP=$DECODE_DP graphs=$ENABLE_GRAPHS connector=$KV_CONNECTOR prefix-caching=$DECODE_PREFIX_CACHING max-num-seqs=$DECODE_MAX_NUM_SEQS spec=${DECODE_SPEC_CONFIG:-none})"
 }
 
 proxy_cmd() {
-  local p_hosts=() d_hosts=()
+  local p_hosts=() d_hosts=() instance_args=() host
   IFS=',' read -r -a p_hosts <<< "$PREFILL_HOSTS"
   IFS=',' read -r -a d_hosts <<< "$DECODE_HOSTS"
-  CMD=(
-    "$PYTHON_BIN" "${SCRIPT_DIR}/toy_proxy_server.py"
-    --host "$PROXY_HOST"
-    --port "$PROXY_PORT"
-    --prefiller-hosts "${p_hosts[@]}"
-    --prefiller-ports "$PREFILL_PORT"
-    --decoder-hosts "${d_hosts[@]}"
-    --decoder-ports "$DECODE_PORT"
-    --kv-connector "$KV_CONNECTOR"
-    --prefiller-bootstrap-port "$PREFILL_MOONCAKE_BOOTSTRAP_PORT"
-  )
-  log "toy proxy on ${PROXY_HOST}:${PROXY_PORT} (connector=$KV_CONNECTOR)"
+  case "$ROUTER" in
+    toy)
+      CMD=(
+        "$PYTHON_BIN" "${SCRIPT_DIR}/toy_proxy_server.py"
+        --host "$PROXY_HOST"
+        --port "$PROXY_PORT"
+        --prefiller-hosts "${p_hosts[@]}"
+        --prefiller-ports "$PREFILL_PORT"
+        --decoder-hosts "${d_hosts[@]}"
+        --decoder-ports "$DECODE_PORT"
+        --kv-connector "$KV_CONNECTOR"
+        --prefiller-bootstrap-port "$PREFILL_MOONCAKE_BOOTSTRAP_PORT"
+      )
+      log "toy proxy on ${PROXY_HOST}:${PROXY_PORT} (connector=$KV_CONNECTOR)"
+      ;;
+    dsv41)
+      # The port's router takes full URLs and one flag per instance, which is
+      # what makes multi-instance deployments (and therefore routing) possible.
+      for host in "${p_hosts[@]}"; do
+        instance_args+=(--prefill "http://${host}:${PREFILL_PORT}")
+      done
+      for host in "${d_hosts[@]}"; do
+        instance_args+=(--decode "http://${host}:${DECODE_PORT}")
+      done
+      CMD=(
+        "$PYTHON_BIN" "${GIT_ROOT}/examples/disaggregated/disaggregated_serving/dsv41_pd_router.py"
+        --host "$PROXY_HOST"
+        --port "$PROXY_PORT"
+        "${instance_args[@]}"
+        --kv-connector "$KV_CONNECTOR"
+        --prefill-bootstrap-port "$PREFILL_MOONCAKE_BOOTSTRAP_PORT"
+        --routing "$ROUTING"
+        --request-timeout-s "$ROUTER_TIMEOUT_S"
+      )
+      log "dsv41 router on ${PROXY_HOST}:${PROXY_PORT} (connector=$KV_CONNECTOR routing=$ROUTING timeout=${ROUTER_TIMEOUT_S}s)"
+      ;;
+    *)
+      # A typo must not silently start the other router: the two have very
+      # different concurrency and routing behaviour.
+      log "FAIL: unknown ROUTER=${ROUTER} (toy|dsv41)"
+      return 1
+      ;;
+  esac
 }
 
 run_test() {
@@ -464,18 +614,34 @@ case "$ROLE" in
   # self-test: it exercises the JSON defaults/overrides and the eager/graph
   # branch without needing a GPU or a model.
   print-config)
-    common_args
+    common_args prefill
     printf 'ATTENTION_CONFIG=%s\n' "$ATTENTION_CONFIG"
     printf 'PREFILL_SPEC_CONFIG=%s\n' "$PREFILL_SPEC_CONFIG"
     printf 'DECODE_SPEC_CONFIG=%s\n' "$DECODE_SPEC_CONFIG"
     printf 'DECODE_HOST=%s\n' "$DECODE_HOST"
     printf 'KV_CONNECTOR=%s\n' "$KV_CONNECTOR"
+    printf 'ROUTER=%s\n' "$ROUTER"
+    printf 'ROUTING=%s\n' "$ROUTING"
+    printf 'ROUTER_TIMEOUT_S=%s\n' "$ROUTER_TIMEOUT_S"
     printf 'PREFILL_MOONCAKE_BOOTSTRAP_PORT=%s\n' "$PREFILL_MOONCAKE_BOOTSTRAP_PORT"
     printf 'DECODE_MOONCAKE_BOOTSTRAP_PORT=%s\n' "$DECODE_MOONCAKE_BOOTSTRAP_PORT"
     printf 'WITH_NVIDIA_PEERMEM=%s\n' "$WITH_NVIDIA_PEERMEM"
     printf 'MOONCAKE_ABORT_REQUEST_TIMEOUT=%s\n' "$MOONCAKE_ABORT_REQUEST_TIMEOUT"
     printf 'MOONCAKE_DEVICE_NAME=%s\n' "$MOONCAKE_DEVICE_NAME"
     printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
+    printf 'VLLM_SM90_FP4_INDEXER=%s\n' "$VLLM_SM90_FP4_INDEXER"
+    printf 'VLLM_SM90_FP8_BLOCK32_STATIC=%s\n' "$VLLM_SM90_FP8_BLOCK32_STATIC"
+    printf 'VLLM_SM90_MHC_SPLIT_H=%s\n' "$VLLM_SM90_MHC_SPLIT_H"
+    printf 'VLLM_SM90_FP4_GROUP6=%s\n' "$VLLM_SM90_FP4_GROUP6"
+    printf 'VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES=%s\n' \
+      "$VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"
+    printf 'MAX_MODEL_LEN=%s\n' "$MAX_MODEL_LEN"
+    printf 'PREFILL_PREFIX_CACHING=%s\n' "$PREFILL_PREFIX_CACHING"
+    printf 'DECODE_PREFIX_CACHING=%s\n' "$DECODE_PREFIX_CACHING"
+    printf 'PREFILL_MAX_NUM_SEQS=%s\n' "$PREFILL_MAX_NUM_SEQS"
+    printf 'DECODE_MAX_NUM_SEQS=%s\n' "$DECODE_MAX_NUM_SEQS"
+    printf 'PREFILL_MAX_NUM_BATCHED_TOKENS=%s\n' "$PREFILL_MAX_NUM_BATCHED_TOKENS"
+    printf 'DECODE_MAX_NUM_BATCHED_TOKENS=%s\n' "$DECODE_MAX_NUM_BATCHED_TOKENS"
     printf 'PREFILL_TP=%s\n' "$PREFILL_TP"
     printf 'DECODE_TP=%s\n' "$DECODE_TP"
     printf 'PREFILL_DP=%s\n' "$PREFILL_DP"
@@ -490,8 +656,10 @@ case "$ROLE" in
     # manager actually launches, and they must survive JSON values with braces.
     prefill_cmd
     printf 'PREFILL_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
+    printf 'PREFILL_SPEC_ARGS_COUNT=%d\n' "${#SPEC_ARGS[@]}"
     decode_cmd
     printf 'DECODE_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
+    printf 'DECODE_SPEC_ARGS_COUNT=%d\n' "${#SPEC_ARGS[@]}"
     # The proxy's connector flag is what makes the Mooncake router bookkeeping
     # (transfer_id, remote_engine_id, remote_bootstrap_addr) appear at all.
     proxy_cmd
