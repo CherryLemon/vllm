@@ -67,6 +67,14 @@ INTERESTING = (
     "vllm:external_prefix_cache_hits",
     "vllm:prompt_tokens",
     "vllm:generation_tokens",
+    # Speculative decoding: a token rate can rise while the *step* cost falls or
+    # the other way round, so acceptance has to be recorded next to the rate.
+    # ``drafts`` is also the iteration count, which turns a token rate into a
+    # real per-verify-step time: a step time obtained by multiplying a TPOT by an
+    # acceptance length measured in a *different* run is not a measurement.
+    "vllm:spec_decode_num_drafts",
+    "vllm:spec_decode_num_draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens",
 )
 
 
@@ -518,7 +526,28 @@ async def main() -> int:
             "external_prefix_cache_hits_delta": poller.delta(
                 "vllm:external_prefix_cache_hits"
             ),
+            "spec_decode_drafts_delta": poller.delta("vllm:spec_decode_num_drafts"),
+            "spec_decode_draft_tokens_delta": poller.delta(
+                "vllm:spec_decode_num_draft_tokens"
+            ),
+            "spec_decode_accepted_tokens_delta": poller.delta(
+                "vllm:spec_decode_num_accepted_tokens"
+            ),
         }
+        # Acceptance length per drafting round; 1.0 means every draft was
+        # rejected, so a "fast" token rate with acceptance 1.0 is just eager
+        # decoding wearing a speculative config.
+        drafts = sum(result["engine_metrics"]["spec_decode_drafts_delta"].values())
+        accepted = sum(
+            result["engine_metrics"]["spec_decode_accepted_tokens_delta"].values()
+        )
+        result["engine_metrics"]["acceptance_length"] = (
+            1.0 + accepted / drafts if drafts else None
+        )
+        print(
+            f"spec decode: drafts={drafts} accepted={accepted} "
+            f"acceptance_length={result['engine_metrics']['acceptance_length']}"
+        )
         print(
             "engine peak running="
             f"{poller.peak('vllm:num_requests_running')} "
