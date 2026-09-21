@@ -19,6 +19,16 @@ from vllm.utils.import_utils import has_cutedsl
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
 
+# `cvt.rn.satfinite.e2m1x2.f32` is a Blackwell (family(100)) PTX instruction:
+# ptxas rejects it for sm_90a ("Instruction 'cvt with .e2m1x2' not supported on
+# .target 'sm_90a'").  On family(90) `_fp32x2_to_fp4x2` therefore falls back to
+# an integer/float round-to-nearest-even packer; for the in-range values this
+# op produces (|x| <= 6 after the ue8m0 scaling) the two are bit-identical, so
+# family(100) keeps using the single-instruction hardware path.
+_FP4_CVT_NEEDS_SOFTWARE = tl.constexpr(
+    current_platform.is_device_capability_family(90)
+)
+
 
 @triton.jit
 def _get_cos_sin(
@@ -36,8 +46,44 @@ def _get_cos_sin(
 
 
 @triton.jit
+def _fp32_to_e2m1_code_rne(x):
+    """E2M1 round-to-nearest-even code (sign in bit 3) for |x| <= 6.
+
+    The E2M1 magnitude grid is 0, .5, 1, 1.5, 2, 3, 4, 6; this counts how many
+    thresholds ``ax >=`` are crossed and then drops an odd index sitting exactly
+    on a halfway point back to the even one.  Equivalent to the hardware
+    ``cvt.rn.satfinite.e2m1x2`` for the in-range, finite inputs produced by the
+    MXFP4 scaling (which never saturates: ``amax / scale <= 6`` by construction).
+    """
+    ax = tl.minimum(tl.abs(x), 6.0)
+    idx = (ax >= 0.25).to(tl.uint8)
+    idx += (ax >= 0.75).to(tl.uint8)
+    idx += (ax >= 1.25).to(tl.uint8)
+    idx += (ax >= 1.75).to(tl.uint8)
+    idx += (ax >= 2.5).to(tl.uint8)
+    idx += (ax >= 3.5).to(tl.uint8)
+    idx += (ax >= 5.0).to(tl.uint8)
+    is_boundary = (
+        (ax == 0.25)
+        | (ax == 0.75)
+        | (ax == 1.25)
+        | (ax == 1.75)
+        | (ax == 2.5)
+        | (ax == 3.5)
+        | (ax == 5.0)
+    )
+    idx = tl.where(is_boundary & ((idx & 1) == 1), idx - 1, idx)
+    sign = ((x < 0) & (idx != 0)).to(tl.uint8)
+    return idx | (sign << 3)
+
+
+@triton.jit
 def _fp32x2_to_fp4x2(x_lo, x_hi):
     # NOTE: $1 is high nibble, $2 is low nibble
+    if _FP4_CVT_NEEDS_SOFTWARE:
+        code_lo = _fp32_to_e2m1_code_rne(x_lo)
+        code_hi = _fp32_to_e2m1_code_rne(x_hi)
+        return (code_lo & 0x0F) | ((code_hi & 0x0F) << 4)
     return tl.inline_asm_elementwise(
         """
         {
@@ -613,7 +659,10 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
+        # The Cute-DSL MXFP4 indexer-Q kernel is a Blackwell-class kernel:
+        # libNVVM rejects it for sm_90a ("NVVM backend compilation failed"),
+        # so SM90 falls through to the Triton implementation below.
+        if has_cutedsl() and not current_platform.is_device_capability_family(90):
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 _INDEXER_Q_MXFP4_KERNEL,
