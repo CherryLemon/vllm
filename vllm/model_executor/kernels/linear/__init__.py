@@ -129,6 +129,10 @@ from vllm.model_executor.kernels.linear.mxfp8.marlin import (
 from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
     RocmDotScaledMxfp8LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.sm90_static import (
+    Sm90StaticMxfp8BmmLinearKernel,
+    Sm90StaticMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.xpu import (
     XPUMxFp8LinearKernel,
 )
@@ -305,6 +309,14 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         MarlinMxfp8LinearKernel,
         MarlinNvFp4LinearKernel,
         MarlinMxFp4LinearKernel,
+    },
+    # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM. NOTE: reaching
+    # this through --linear-backend also requires adding the name to the
+    # LinearBackend Literal in vllm/config/kernel.py (owned outside WP B);
+    # the supported opt-in today is VLLM_SM90_FP8_BLOCK32_STATIC=1.
+    "mxfp8_sm90_static": {
+        Sm90StaticMxfp8LinearKernel,
+        Sm90StaticMxfp8BmmLinearKernel,
     },
     "triton": {
         TritonInt8ScaledMMLinearKernel,
@@ -530,8 +542,16 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 }
 
 # in priority/performance order (when available)
-_POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
-    PlatformEnum.CUDA: [
+def _cuda_mxfp8_kernels() -> list[type[Mxfp8LinearKernel]]:
+    """CUDA MXFP8 kernel priority list, in priority/performance order.
+
+    ``Sm90StaticMxfp8LinearKernel`` is default-off (its ``is_supported`` also
+    requires ``VLLM_SM90_FP8_BLOCK32_STATIC=1``). With the opt-in off it is
+    appended last, so ``auto`` keeps selecting Marlin (SM90) / FlashInfer
+    (SM100) exactly as before. With the opt-in on it is inserted directly
+    above Marlin, taking precedence on SM90 while SM100 entries stay ahead.
+    """
+    kernels: list[type[Mxfp8LinearKernel]] = [
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
@@ -539,7 +559,23 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
         EmulationMxfp8LinearKernel,
         HummingMxfp8LinearKernel,
         FlashInferTrtllmMxfp8LinearKernel,
-    ],
+    ]
+    from vllm.model_executor.kernels.linear.mxfp8.sm90_static import (
+        _sm90_static_enabled,
+    )
+
+    if _sm90_static_enabled():
+        kernels.insert(
+            kernels.index(MarlinMxfp8LinearKernel),
+            Sm90StaticMxfp8LinearKernel,
+        )
+    else:
+        kernels.append(Sm90StaticMxfp8LinearKernel)
+    return kernels
+
+
+_POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
+    PlatformEnum.CUDA: _cuda_mxfp8_kernels(),
     PlatformEnum.ROCM: [
         # Native CDNA4 (gfx950) MX linear; is_supported() gates to gfx95x and
         # falls through to BF16 emulation (hipBLASLt) elsewhere / on regression.
@@ -892,6 +928,15 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     platform = current_platform._enum
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
+        # NOTE(WP B): Sm90StaticMxfp8BmmLinearKernel is deliberately NOT added
+        # here. On SM90 wo_a is consumed by
+        # models/deepseek_v4/nvidia/ops/o_proj.py::deep_gemm_fp8_o_proj, which
+        # inspects wo_a.weight.dtype: if the weight is still fp8 it routes the
+        # grouped GEMM into DeepGEMM's fp8_einsum with its own block-scale
+        # layout. The emulation kernel dequantises wo_a to bf16, which is what
+        # selects the supported bf16 torch.bmm path on SM90. Installing an fp8
+        # static BMM here would flip that branch to an incompatible scale
+        # layout, so it must stay a no-op for `auto`.
         possible = (
             [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
             if current_platform.is_cuda()
@@ -1306,6 +1351,8 @@ __all__ = [
     "FlashInferCutlassMxfp8LinearKernel",
     "FlashInferTrtllmMxfp8LinearKernel",
     "MarlinMxfp8LinearKernel",
+    "Sm90StaticMxfp8LinearKernel",
+    "Sm90StaticMxfp8BmmLinearKernel",
     "XPUMxFp8LinearKernel",
     "EmulationMxfp8LinearKernel",
     "CutlassNvFp4LinearKernel",
