@@ -613,3 +613,26 @@ def test_router_leg_timeout_is_stated_not_implicit():
     assert cfg["ROUTER_TIMEOUT_S"] == "1800"
     # The toy proxy has no such flag; setting the variable must not add one.
     assert "--request-timeout-s" not in args_of(harness_config(), "PROXY_CMD")
+
+
+def test_profiler_config_is_per_role_and_off_by_default():
+    """A profile has to come from the batch shape under investigation.
+
+    The profiler endpoints only exist on the instance the config was given to,
+    so the two roles must be settable independently -- and the default must stay
+    off, because a trace directory silently enabled on both roles changes what
+    is being measured.
+    """
+    cfg = harness_config()
+    assert cfg["PREFILL_PROFILER_CONFIG"] == ""
+    assert cfg["DECODE_PROFILER_CONFIG"] == ""
+    for key in ("PREFILL_CMD", "DECODE_CMD"):
+        assert "--profiler-config" not in args_of(cfg, key)
+
+    profiler = '{"profiler":"torch","torch_profiler_dir":"/work/profiles"}'
+    cfg = harness_config(PREFILL_PROFILER_CONFIG=profiler)
+    prefill = args_of(cfg, "PREFILL_CMD")
+    decode = args_of(cfg, "DECODE_CMD")
+    # One argv entry, JSON intact.
+    assert prefill[prefill.index("--profiler-config") + 1] == profiler
+    assert "--profiler-config" not in decode

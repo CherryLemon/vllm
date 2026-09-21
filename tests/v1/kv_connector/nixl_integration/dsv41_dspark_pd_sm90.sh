@@ -114,6 +114,9 @@
 #                         off (num_speculative_tokens must be > 0).  Turning it
 #                         off changes the KV layout, so a PD ablation must do it
 #                         on both sides and re-check the graph shapes.
+#   PREFILL_PROFILER_CONFIG / DECODE_PROFILER_CONFIG - JSON --profiler-config
+#                         for one role (empty = off).  Only the API server of the
+#                         profiled role exposes /start_profile and /stop_profile.
 #   VLLM_SM90_FP4_INDEXER / VLLM_SM90_FP8_BLOCK32_STATIC / VLLM_SM90_MHC_SPLIT_H
 #                       - (default 1) the ported SM90 kernels; exported into the
 #                         service environment, not just the caller's shell.
@@ -221,6 +224,13 @@ ATTENTION_CONFIG="${ATTENTION_CONFIG:-$DEFAULT_ATTENTION_CONFIG}"
 # it off on both sides and re-check graphs and cache compatibility.
 PREFILL_SPEC_CONFIG="${PREFILL_SPEC_CONFIG:-$DEFAULT_PREFILL_SPEC_CONFIG}"
 DECODE_SPEC_CONFIG="${DECODE_SPEC_CONFIG:-$DEFAULT_DECODE_SPEC_CONFIG}"
+
+# Torch profiler, per role, empty = off.  A profile that is not tied to one
+# instance and one concurrency tells nothing: the trace has to come from the
+# batch shape under investigation, and it must be collected next to a
+# profiler-free run of the same load.
+PREFILL_PROFILER_CONFIG="${PREFILL_PROFILER_CONFIG:-}"
+DECODE_PROFILER_CONFIG="${DECODE_PROFILER_CONFIG:-}"
 
 ENABLE_GRAPHS="${ENABLE_GRAPHS:-0}"
 
@@ -424,6 +434,16 @@ spec_config_args() {
   SPEC_ARGS=(--speculative-config "$spec")
 }
 
+# Profiling is off unless a config is given; the value is a JSON object
+# ({"profiler":"torch","torch_profiler_dir":"/work/profiles"}).
+PROFILER_ARGS=()
+profiler_args() {
+  local config="$1"
+  PROFILER_ARGS=()
+  [ -n "$config" ] || return 0
+  PROFILER_ARGS=(--profiler-config "$config")
+}
+
 # Each service command is built into the ``CMD`` array (one element per argv
 # entry) instead of being a function that shells out; ``start_service`` runs it
 # under ``setsid`` so the recorded PID is the service itself.  ``env`` carries
@@ -509,11 +529,13 @@ prefill_cmd() {
   parallel_args "$PREFILL_TP" "$PREFILL_DP"
   connector_env prefill
   spec_config_args "$PREFILL_SPEC_CONFIG"
+  profiler_args "$PREFILL_PROFILER_CONFIG"
   CMD=(
     env
     "${CONNECTOR_ENV[@]}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
     "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}" "${SPEC_ARGS[@]}"
+    "${PROFILER_ARGS[@]}"
     --port "$PREFILL_PORT"
     --kv-transfer-config "$(kv_transfer_config kv_producer)"
   )
@@ -525,11 +547,13 @@ decode_cmd() {
   parallel_args "$DECODE_TP" "$DECODE_DP"
   connector_env decode
   spec_config_args "$DECODE_SPEC_CONFIG"
+  profiler_args "$DECODE_PROFILER_CONFIG"
   CMD=(
     env
     "${CONNECTOR_ENV[@]}"
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
     "${COMMON_ARGS[@]}" "${PARALLEL_ARGS[@]}" "${GRAPH_ARGS[@]}" "${SPEC_ARGS[@]}"
+    "${PROFILER_ARGS[@]}"
     --port "$DECODE_PORT"
     --kv-transfer-config "$(kv_transfer_config kv_consumer)"
   )
@@ -657,9 +681,11 @@ case "$ROLE" in
     prefill_cmd
     printf 'PREFILL_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
     printf 'PREFILL_SPEC_ARGS_COUNT=%d\n' "${#SPEC_ARGS[@]}"
+    printf 'PREFILL_PROFILER_CONFIG=%s\n' "$PREFILL_PROFILER_CONFIG"
     decode_cmd
     printf 'DECODE_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
     printf 'DECODE_SPEC_ARGS_COUNT=%d\n' "${#SPEC_ARGS[@]}"
+    printf 'DECODE_PROFILER_CONFIG=%s\n' "$DECODE_PROFILER_CONFIG"
     # The proxy's connector flag is what makes the Mooncake router bookkeeping
     # (transfer_id, remote_engine_id, remote_bootstrap_addr) appear at all.
     proxy_cmd
