@@ -127,7 +127,12 @@ class MetricsPoller:
         for match in METRIC_RE.finditer(text):
             name = match.group("name")
             if name not in INTERESTING:
-                continue
+                # Counter series are exposed with a `_total` suffix while the
+                # declared name (and the docs) omit it; without this the
+                # counters silently read as zero, which is worse than missing.
+                name = name.removesuffix("_total")
+                if name not in INTERESTING:
+                    continue
             labels = {
                 m.group("key"): m.group("value")
                 for m in LABEL_RE.finditer(match.group("labels"))
@@ -139,16 +144,19 @@ class MetricsPoller:
             out.setdefault(name, {})[key] = float(match.group("value"))
         return out
 
+    async def sample_once(self, session: aiohttp.ClientSession) -> None:
+        t = time.time()
+        merged: dict[str, dict[str, float]] = {}
+        for url in self.urls:
+            for name, values in (await self._read(session, url)).items():
+                merged.setdefault(name, {}).update(values)
+        if merged:
+            self.samples.append(MetricsSample(t=t, values=merged))
+
     async def run(self) -> None:
         async with aiohttp.ClientSession() as session:
             while not self._stop.is_set():
-                t = time.time()
-                merged: dict[str, dict[str, float]] = {}
-                for url in self.urls:
-                    for name, values in (await self._read(session, url)).items():
-                        merged.setdefault(name, {}).update(values)
-                if merged:
-                    self.samples.append(MetricsSample(t=t, values=merged))
+                await self.sample_once(session)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
 
@@ -513,6 +521,10 @@ async def main() -> int:
     if poller and poller_task:
         poller.stop()
         await poller_task
+        # One final sample so a run shorter than the polling interval still has
+        # a "last" value to difference the counters against.
+        async with aiohttp.ClientSession() as session:
+            await poller.sample_once(session)
         result["engine_metrics"] = {
             "urls": args.metrics_url,
             "samples": len(poller.samples),
