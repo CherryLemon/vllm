@@ -160,6 +160,21 @@ requires_sm90 = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _workspace_manager():
+    """The native indexer top-k backends take their scratch from vLLM's
+    workspace manager, which the model runner normally initialises.  Any test
+    that drives ``get_indexer_topk`` needs it, and without it the failure is an
+    assertion deep inside the top-k rather than a test failure."""
+    if not _sm90_available():
+        yield
+        return
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    init_workspace_manager(torch.device("cuda"))
+    yield
+
+
 def _rand_q(rows: int, heads: int, device) -> torch.Tensor:
     return torch.randint(
         0, 256, (rows, heads, HALF_D), device=device, dtype=torch.uint8
@@ -690,3 +705,147 @@ def test_finalize_candidate_topk_sm90_k_invariant():
             torch.empty((rows, 4), dtype=torch.int32),
             block_size=16,
         )
+
+# ---------------------------------------------------------------------------
+# Full production chain: publisher -> compact logits -> native TopK -> remap
+# ---------------------------------------------------------------------------
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    "k_cand,n_vis,topk_tokens",
+    [
+        # Logical context is far wider than the compact matrix (the case the
+        # old length-domain bug read out of bounds on).
+        (16, 1000, 512),
+        # Compact width just exceeds index_topk, so the top-k actually fills.
+        (128, 1024, 512),
+        # Everything is padding.
+        (16, 0, 512),
+    ],
+)
+def test_compact_decode_chain_matches_dense_candidate_oracle(
+    k_cand: int, n_vis: int, topk_tokens: int
+):
+    """Drive the real publisher -> logits -> native TopK -> remap chain.
+
+    The length-domain fix is only *proven* if the native TopK runs on the
+    compact row and the remap agrees with a dense candidate-gather oracle.  A
+    unit test of the length contract (``_compact_decode_lengths``) cannot catch
+    a regression in the call site, and the compact/dense logits tests never run
+    the top-k at all -- which is exactly where the out-of-bounds read was.
+
+    Oracle: score every position densely, gather the candidate positions'
+    values, take the top-k among the visible ones, and compare the resulting
+    set of request-local logical positions.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+    from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+
+    torch.manual_seed(1234 + k_cand)
+    device = "cuda"
+    page_size = PAGE_SIZE
+    heads = 32
+    num_blocks, cbs, rows = 32, 8, 3
+    width = k_cand * cbs
+
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    ).repeat(rows, 1)
+    context_lens = torch.full((rows,), n_vis, device=device, dtype=torch.int32)
+
+    # Production-shaped candidate order: the newest (partial) block first, then
+    # the older blocks ascending, then -1 padding.  Not sorted by id.
+    n_cand_blocks = max(1, (n_vis + cbs - 1) // cbs) if n_vis else 0
+    newest = min(n_cand_blocks - 1, num_blocks * page_size // cbs - 1) if n_vis else -1
+    cand_ids = []
+    if newest >= 0:
+        cand_ids.append(newest)
+    cand_ids += [b for b in range(k_cand - 1) if b != newest and b < num_blocks]
+    cand_ids = (cand_ids + [-1] * k_cand)[:k_cand]
+    candidate_blocks = torch.tensor(cand_ids, device=device, dtype=torch.int32)
+    candidate_blocks = candidate_blocks.reshape(1, -1).repeat(rows, 1)
+
+    # --- production chain -------------------------------------------------
+    logits = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=page_size,
+        write_candidates=False,
+    )
+    assert logits.shape == (rows, width)
+
+    compact_lens = SparseMQAIndexer._compact_decode_lengths(rows, width, logits.device)
+    selected = torch.empty((rows, topk_tokens), dtype=torch.int32, device=device)
+    get_indexer_topk("auto")(
+        logits, compact_lens, 1, selected, topk_tokens, width
+    )
+    # The native top-k must only ever emit compact columns.
+    assert int(selected.max()) < width, "top-k returned a column outside the row"
+    page_scratch = torch.empty_like(selected)
+    raw = torch.full((rows, topk_tokens), -1, dtype=torch.int32, device=device)
+    finalize_candidate_topk_sm90(
+        selected,
+        logits,
+        context_lens,
+        block_table,
+        page_scratch,
+        block_size=page_size,
+        candidate_blocks=candidate_blocks,
+        candidate_block_size=cbs,
+        raw_indices=raw,
+    )
+
+    # --- dense candidate-gather oracle ------------------------------------
+    dense = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=num_blocks * page_size,
+    )
+    cols = torch.arange(width, device=device)
+    block_col = cols // cbs
+    logical = (
+        candidate_blocks[:, block_col].to(torch.int64) * cbs
+        + (cols % cbs).to(torch.int64)
+    )
+    valid = (candidate_blocks[:, block_col] >= 0) & (logical < n_vis)
+    gathered = dense.gather(1, logical.clamp(min=0))
+    gathered = torch.where(valid, gathered, float("-inf"))
+    k = min(topk_tokens, width)
+    top_vals, top_cols = gathered.topk(k, dim=-1)
+    oracle = torch.where(
+        top_vals > float("-inf"),
+        logical.gather(1, top_cols),
+        torch.full_like(top_cols, -1, dtype=torch.int64),
+    )
+
+    for r in range(rows):
+        got = sorted(int(x) for x in raw[r].tolist() if x >= 0)
+        want = sorted(int(x) for x in oracle[r].tolist() if x >= 0)
+        assert got == want, (
+            f"row {r} (k_cand={k_cand}, n_vis={n_vis}): the production chain and "
+            f"the dense candidate oracle disagree\n  got  ({len(got)}): {got[:12]}\n"
+            f"  want ({len(want)}): {want[:12]}"
+        )
+        # Every remapped position must be a real, visible, candidate position.
+        for pos in got:
+            assert pos < n_vis, f"remapped position {pos} is outside n_vis={n_vis}"
+            assert (pos % cbs) < cbs and (pos // cbs) in cand_ids, pos
