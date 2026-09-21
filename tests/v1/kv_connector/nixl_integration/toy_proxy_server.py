@@ -16,6 +16,67 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 
+def mooncake_mode() -> bool:
+    """Whether the instances were started with MooncakeConnector.
+
+    The two connectors do not differ in the protocol they speak (both use
+    ``kv_role`` plus ``do_remote_decode``/``do_remote_prefill``), only in *who
+    supplies the bookkeeping fields*:
+
+    * ``NixlConnector`` answers with a fully populated ``kv_transfer_params``
+      (its own ``remote_*`` fields), so forwarding the prefiller's response is
+      enough.
+    * ``MooncakeConnector`` expects the router to mint the ``transfer_id`` it
+      sends to the prefiller and, for the decoder, to name the prefiller that
+      holds the blocks: it needs ``remote_engine_id`` and
+      ``remote_bootstrap_addr``, neither of which any vLLM instance produces
+      (see ``examples/disaggregated/mooncake_connector``).  Forwarding the
+      response instead leaves the prefiller logging "Missing transfer_id in
+      kv_transfer_params from router!" and the decoder recomputing locally.
+    """
+    return "Mooncake" in global_args.kv_connector
+
+
+def transfer_id_for(request_id: str) -> str:
+    """The id both legs of one request share (router-minted)."""
+    return f"xfer-{request_id}"
+
+
+def prefiller_params(request_id: str) -> dict:
+    """``kv_transfer_params`` for the prefiller (the first leg)."""
+    if mooncake_mode():
+        return {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "transfer_id": transfer_id_for(request_id),
+        }
+    return {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+    }
+
+
+def decoder_params(request_id: str, prefill_client_info: dict) -> dict:
+    """``kv_transfer_params`` for the decoder (the second leg).
+
+    ``remote_engine_id`` must be the id the prefiller's bootstrap server
+    reports -- the decoder looks it up in exactly that table -- and
+    ``remote_bootstrap_addr`` the HTTP address that server answers on.
+    """
+    dp_rank = next_prefiller_dp_rank(prefill_client_info)
+    return {
+        "do_remote_decode": False,
+        "do_remote_prefill": True,
+        "remote_bootstrap_addr": prefill_client_info["bootstrap_addr"],
+        "remote_engine_id": prefill_client_info["dp_engine_id"][dp_rank],
+        "transfer_id": transfer_id_for(request_id),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager to handle startup and shutdown events."""
@@ -39,6 +100,13 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                # Mooncake: the prefiller's bootstrap HTTP endpoint and the
+                # engine id per data-parallel rank (learned from /query).
+                "bootstrap_addr": (
+                    f"http://{host}:{global_args.prefiller_bootstrap_port}"
+                ),
+                "dp_engine_id": {},
+                "dp_next": 0,
             }
         )
 
@@ -111,6 +179,13 @@ def parse_args():
         "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[8200]
     )
 
+    # Connector the instances were started with.  Only the *router bookkeeping*
+    # differs; the request/response protocol is the same.  Any name containing
+    # "Mooncake" selects the Mooncake contract.
+    parser.add_argument("--kv-connector", type=str, default="NixlConnector")
+    # The prefiller's Mooncake bootstrap server (`VLLM_MOONCAKE_BOOTSTRAP_PORT`).
+    parser.add_argument("--prefiller-bootstrap-port", type=int, default=8998)
+
     args = parser.parse_args()
 
     # Validate and pair hosts with ports
@@ -155,14 +230,7 @@ async def send_request_to_service(
 ):
     """Send a request to a service using a client from the pool."""
     req_data = req_data.copy()
-    req_data["kv_transfer_params"] = {
-        "do_remote_decode": True,
-        "do_remote_prefill": False,
-        "remote_engine_id": None,
-        "remote_block_ids": None,
-        "remote_host": None,
-        "remote_port": None,
-    }
+    req_data["kv_transfer_params"] = prefiller_params(request_id)
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     if "max_completion_tokens" in req_data:
@@ -210,6 +278,37 @@ async def stream_service_response(
             yield chunk
 
 
+async def ensure_prefiller_info(prefill_client_info: dict):
+    """Learn the prefiller's engine ids (one per DP rank) from /query.
+
+    Mooncake's decoder resolves ``remote_engine_id`` against the bootstrap
+    server's answer, so the id the router sends must be the one the bootstrap
+    server reports -- not the URL, not the host:port.
+    """
+    if prefill_client_info["dp_engine_id"]:
+        return
+    url = prefill_client_info["bootstrap_addr"] + "/query"
+    response = await prefill_client_info["client"].get(url)
+    response.raise_for_status()
+    data = response.json()
+    for dp_rank, dp_entry in data.items():
+        prefill_client_info["dp_engine_id"][int(dp_rank)] = dp_entry["engine_id"]
+    if not prefill_client_info["dp_engine_id"]:
+        raise RuntimeError(f"prefiller {url} reported no data-parallel ranks")
+    print(
+        f"Prefiller {prefill_client_info['host']}:{prefill_client_info['port']} "
+        f"has {len(prefill_client_info['dp_engine_id'])} DP rank(s)"
+    )
+
+
+def next_prefiller_dp_rank(prefill_client_info: dict) -> int:
+    """Round-robin over the prefiller's DP ranks."""
+    ranks = sorted(prefill_client_info["dp_engine_id"])
+    rank = ranks[prefill_client_info["dp_next"] % len(ranks)]
+    prefill_client_info["dp_next"] += 1
+    return rank
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
@@ -223,12 +322,21 @@ async def _handle_completions(api: str, request: Request):
             prefill_client_info, api, req_data, request_id
         )
 
-        # Extract the needed fields
-        response_json = response.json()
-        await response.aclose()  # CRITICAL: Release connection back to pool
-        kv_transfer_params = response_json.get("kv_transfer_params", {})
-        if kv_transfer_params:
-            req_data["kv_transfer_params"] = kv_transfer_params
+        if mooncake_mode():
+            # The prefiller's response carries nothing the decoder needs here,
+            # but it must still be released back to the pool.
+            await response.aclose()
+            await ensure_prefiller_info(prefill_client_info)
+            req_data["kv_transfer_params"] = decoder_params(
+                request_id, prefill_client_info
+            )
+        else:
+            # Extract the needed fields
+            response_json = response.json()
+            await response.aclose()  # CRITICAL: Release connection back to pool
+            kv_transfer_params = response_json.get("kv_transfer_params", {})
+            if kv_transfer_params:
+                req_data["kv_transfer_params"] = kv_transfer_params
 
         # Get the next decode client in round-robin fashion
         decode_client_info = get_next_client(request.app, "decode")

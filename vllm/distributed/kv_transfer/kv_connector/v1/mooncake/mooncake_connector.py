@@ -12,12 +12,16 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
+# huggingface_hub >= 1.0 no longer re-exports ``httpx`` from ``.utils`` (it
+# lives in the private ``._http``), so ``from huggingface_hub.utils import
+# httpx`` raised ImportError and the whole connector was unloadable.  Only the
+# plain client and exceptions are used here, so import httpx directly.
+import httpx
 import msgspec
 import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from huggingface_hub.utils import httpx
 
 from vllm import envs
 from vllm.config import VllmConfig

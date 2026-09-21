@@ -65,6 +65,10 @@
 #   MOONCAKE_ABORT_REQUEST_TIMEOUT - forwarded when set; how long the producer
 #                         keeps blocks for an unsent transfer before freeing
 #                         them (connector default 480 s)
+#   MOONCAKE_FORCE_HCA  - forwarded as the Mooncake transfer engine's
+#                         MC_FORCE_HCA when set.  Needed on a multi-rail host:
+#                         each side's topology discovery otherwise picks its own
+#                         device and RDMA writes time out across fabrics.
 #   PREFILL_HOSTS / DECODE_HOSTS - comma-separated host list for the proxy
 #   PROXY_HOST          - host the proxy listens on (default 127.0.0.1)
 #   DECODE_HOST         - host the *test* reads decode /metrics from
@@ -119,6 +123,9 @@ DECODE_MOONCAKE_BOOTSTRAP_PORT="${DECODE_MOONCAKE_BOOTSTRAP_PORT:-8999}"
 # the transfer engine's default (peermem on).
 WITH_NVIDIA_PEERMEM="${WITH_NVIDIA_PEERMEM:-}"
 MOONCAKE_ABORT_REQUEST_TIMEOUT="${MOONCAKE_ABORT_REQUEST_TIMEOUT:-}"
+# Mooncake transfer-engine rail (MC_FORCE_HCA); empty = engine's own discovery.
+# Both instances must name the same rail, or the RDMA writes hang.
+MOONCAKE_FORCE_HCA="${MOONCAKE_FORCE_HCA:-}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 
@@ -357,6 +364,14 @@ connector_env() {
         CONNECTOR_ENV+=(
           "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=${MOONCAKE_ABORT_REQUEST_TIMEOUT}"
         )
+      # Mooncake transfer-engine rail selection (MC_FORCE_HCA).  On a host with
+      # several RoCE rails the engine's topology discovery can pick a different
+      # device per side -- measured here: one side landed on the management bond
+      # (10.8.2.x) and the other on a 100.75.4.x rail, after which every RDMA
+      # write timed out ("transport retry counter exceeded").  Pinning both
+      # sides to the same rail is what makes the data path work.
+      [ -n "$MOONCAKE_FORCE_HCA" ] &&
+        CONNECTOR_ENV+=("MC_FORCE_HCA=${MOONCAKE_FORCE_HCA}")
       ;;
     *)
       # Caught here rather than at launch time: a typo must not start a server
@@ -412,8 +427,10 @@ proxy_cmd() {
     --prefiller-ports "$PREFILL_PORT"
     --decoder-hosts "${d_hosts[@]}"
     --decoder-ports "$DECODE_PORT"
+    --kv-connector "$KV_CONNECTOR"
+    --prefiller-bootstrap-port "$PREFILL_MOONCAKE_BOOTSTRAP_PORT"
   )
-  log "toy proxy on ${PROXY_HOST}:${PROXY_PORT}"
+  log "toy proxy on ${PROXY_HOST}:${PROXY_PORT} (connector=$KV_CONNECTOR)"
 }
 
 run_test() {
@@ -454,6 +471,7 @@ case "$ROLE" in
     printf 'DECODE_MOONCAKE_BOOTSTRAP_PORT=%s\n' "$DECODE_MOONCAKE_BOOTSTRAP_PORT"
     printf 'WITH_NVIDIA_PEERMEM=%s\n' "$WITH_NVIDIA_PEERMEM"
     printf 'MOONCAKE_ABORT_REQUEST_TIMEOUT=%s\n' "$MOONCAKE_ABORT_REQUEST_TIMEOUT"
+    printf 'MOONCAKE_FORCE_HCA=%s\n' "$MOONCAKE_FORCE_HCA"
     printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
     printf 'PREFILL_TP=%s\n' "$PREFILL_TP"
     printf 'DECODE_TP=%s\n' "$DECODE_TP"
@@ -471,6 +489,10 @@ case "$ROLE" in
     printf 'PREFILL_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
     decode_cmd
     printf 'DECODE_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
+    # The proxy's connector flag is what makes the Mooncake router bookkeeping
+    # (transfer_id, remote_engine_id, remote_bootstrap_addr) appear at all.
+    proxy_cmd
+    printf 'PROXY_CMD=%s\n' "$(printf '%s\x1f' "${CMD[@]}")"
     ;;
   all)
     prefill_cmd; start_service prefill "${CMD[@]}"

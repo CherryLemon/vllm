@@ -150,6 +150,22 @@ def test_optional_connector_knobs_are_omitted_when_unset():
         )
 
 
+def test_proxy_is_told_which_connector_the_instances_use():
+    """Mooncake's router bookkeeping depends on it; NIXL must stay the default."""
+    cfg = harness_config(
+        KV_CONNECTOR="MooncakeConnector", PREFILL_MOONCAKE_BOOTSTRAP_PORT="9100"
+    )
+    args = args_of(cfg, "PROXY_CMD")
+    assert args[args.index("--kv-connector") + 1] == "MooncakeConnector"
+    assert args[args.index("--prefiller-bootstrap-port") + 1] == "9100"
+
+    args = args_of(harness_config(), "PROXY_CMD")
+    assert args[args.index("--kv-connector") + 1] == "NixlConnector"
+    # The default bootstrap port is the library default, so a Mooncake run that
+    # never set it still tells the proxy the truth.
+    assert args[args.index("--prefiller-bootstrap-port") + 1] == "8998"
+
+
 def test_unknown_connector_fails_instead_of_starting_a_mismatched_pair():
     env = dict(os.environ)
     env["ROLE"] = "print-config"
