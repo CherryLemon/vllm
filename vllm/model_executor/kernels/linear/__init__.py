@@ -920,6 +920,55 @@ def choose_mp_linear_kernel(
     )
 
 
+def _mxfp8_bmm_candidate_kernels() -> list[type[Mxfp8LinearKernel]]:
+    """Candidate kernels for an ``is_bmm`` MXFP8 layer (DeepSeek-V4.1 ``wo_a``).
+
+    Only consulted on CUDA (the caller guards on ``current_platform.is_cuda()``).
+
+    ``Sm90StaticMxfp8BmmLinearKernel`` is deliberately absent, and this is a
+    contract-level decision, not merely an incompatible scale layout. On SM90
+    that class is *dead code* as a Linear kernel:
+
+    * ``wo_a`` is never invoked as a ``LinearBase``. It is a weight container
+      read directly by ``models/deepseek_v4/nvidia/ops/o_proj.py::
+      deep_gemm_fp8_o_proj`` (reached from the FlashMLA and FlashInfer
+      backends, e.g. ``deepseek_v41/nvidia/flashmla.py:61``). The only hook
+      such a kernel gets is ``process_weights_after_loading``;
+      ``apply_weights`` is never called.
+    * Registering it would keep ``wo_a.weight`` in fp8, which flips the
+      *dtype-keyed* ``use_fp8`` gate in ``deep_gemm_fp8_o_proj``
+      (``o_proj.py:49``) into the SM90 DeepGEMM ``fp8_einsum``, whose recipe is
+      ``(1, 128, 128)`` fp32 scales (``o_proj.py:22-26``), whereas the MXFP8
+      weight scale is the per-output-row replicated ``[N, K // 32]`` uint8
+      ue8m0 tensor (``mxfp8/sm90_static.py:26-32``): different group size,
+      scale dtype and layout, not reconcilable by a cast. The emulation kernel
+      instead dequantises ``wo_a`` to bf16 at load
+      (``mxfp8/emulation.py:47-50``), which is exactly what makes
+      ``deep_gemm_fp8_o_proj`` take the supported bf16 ``torch.bmm`` path
+      (``o_proj.py:80-86``) on SM90.
+    * At TP8 the BMM form has no payoff: ``bmm_batch_size`` is
+      ``n_local_groups = o_groups // tp_size = 8 // 8 = 1``
+      (``deepseek_v41/attention.py:291-292,382-383``), so the kernel's
+      ``for g in range(group)`` runs a single 2D GEMM. The grouped form only
+      becomes a real batch at TP <= 4 (``G`` in {2, 4, 8}).
+    * ``(N, K) = (1024, 4096)`` (``N = o_lora_rank``;
+      ``K = heads_per_group * head_dim``) has no entry in
+      ``_SM90_STATIC_CONFIGS``, so it would fall back to the untuned
+      ``_SM90_GENERIC_CONFIG`` (``mxfp8/sm90_static.py:745-762``).
+
+    Wiring it in is therefore an o-projection *contract* change, done together:
+    a dispatch branch in ``deep_gemm_fp8_o_proj`` keyed on the selected kernel
+    class and placed *before* the dtype-based ``use_fp8`` gate, the activation
+    quantisation handed to the kernel (``quantize=False`` on
+    ``fused_inv_rope_fp8_quant``), and ``supports_pre_processed_weights=False``
+    honoured by ``ModelOptLinearMethod.process_weights_after_loading``.
+    ``tests/kernels/linear/test_wo_a_sm90_static_bmm_scope.py`` pins this
+    policy on CPU and fails loudly if the class is registered without the rest
+    of the contract.
+    """
+    return [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
+
+
 def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8LinearKernel:
     """Select and instantiate the best MXFP8 linear kernel for the
     current platform."""
@@ -928,19 +977,8 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     platform = current_platform._enum
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
-        # NOTE(WP B): Sm90StaticMxfp8BmmLinearKernel is deliberately NOT added
-        # here. On SM90 wo_a is consumed by
-        # models/deepseek_v4/nvidia/ops/o_proj.py::deep_gemm_fp8_o_proj, which
-        # inspects wo_a.weight.dtype: if the weight is still fp8 it routes the
-        # grouped GEMM into DeepGEMM's fp8_einsum with its own block-scale
-        # layout. The emulation kernel dequantises wo_a to bf16, which is what
-        # selects the supported bf16 torch.bmm path on SM90. Installing an fp8
-        # static BMM here would flip that branch to an incompatible scale
-        # layout, so it must stay a no-op for `auto`.
         possible = (
-            [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
-            if current_platform.is_cuda()
-            else []
+            _mxfp8_bmm_candidate_kernels() if current_platform.is_cuda() else []
         )
     else:
         possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
