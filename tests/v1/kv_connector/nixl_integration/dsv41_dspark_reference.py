@@ -18,6 +18,17 @@ import openai
 from test_dsv41_dspark_pd import MAX_TOKENS, MODEL_NAME, PROMPTS
 
 
+def _complete(client, prompt: str, max_tokens: int) -> str:
+    return client.completions.create(
+        model=MODEL_NAME,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        top_p=1.0,
+        extra_body={"add_special_tokens": False},
+    ).choices[0].text
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -28,18 +39,16 @@ def main() -> None:
     client = openai.OpenAI(
         api_key="EMPTY", base_url=f"http://{args.host}:{args.port}/v1"
     )
-    ref: dict[str, str] = {}
+    ref: dict[str, dict[str, str]] = {}
     for prompt in PROMPTS:
-        resp = client.completions.create(
-            model=MODEL_NAME,
-            prompt=prompt,
-            max_tokens=MAX_TOKENS,
-            temperature=0.0,
-            top_p=1.0,
-            extra_body={"add_special_tokens": False},
-        )
-        ref[prompt] = resp.choices[0].text
-        print(f"{prompt[:44]!r} -> {ref[prompt][:60]!r}")
+        text = _complete(client, prompt, MAX_TOKENS)
+        # The first token is the stable, transport-sensitive quantity the PD
+        # test gates on; record it from its own request rather than slicing the
+        # continuation (detokenisation boundaries are not guaranteed to line
+        # up with a 1-token generation).
+        first = _complete(client, prompt, 1)
+        ref[prompt] = {"text": text, "first_token": first}
+        print(f"{prompt[:44]!r} -> {text[:50]!r} | first={first!r}")
     with open(args.out, "w") as fh:
         json.dump(ref, fh, indent=1)
     print(f"wrote {len(ref)} prompts -> {args.out}")

@@ -36,9 +36,16 @@
 #   PROXY_PORT          - (default 8192)
 #   NIXL_SIDE_CHANNEL_HOST - address the NIXL side channel binds to
 #   PREFILL_HOSTS / DECODE_HOSTS - comma-separated host list for the proxy
+#   PROXY_HOST          - host the proxy listens on (default 127.0.0.1)
+#   DECODE_HOST         - host the *test* reads decode /metrics from
+#                         (defaults to the first entry of DECODE_HOSTS).
+#                         Set it explicitly when the proxy runs on a third
+#                         machine: decode /metrics is not on the proxy.
 #   ATTENTION_CONFIG    - (default mxfp4 indexer + sparse logits)
 #   PREFILL_SPEC_CONFIG / DECODE_SPEC_CONFIG - speculative configs
-#   ENABLE_GRAPHS       - 1 to keep CUDA graphs on (default 0 = eager)
+#   ENABLE_GRAPHS       - 1 keeps CUDA graphs on (default 0 = --enforce-eager)
+#   BUCKETS             - capture sizes used when ENABLE_GRAPHS=1
+#   DSV41_STRICT_REFERENCE - 1 makes the reference comparison a hard gate
 set -euo pipefail
 
 ROLE="${ROLE:-all}"
@@ -50,7 +57,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.88}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-# Leave empty to let the backend pick its required attention block size.
+# Empty = let the attention backend pick the block size it requires.
 BLOCK_SIZE="${BLOCK_SIZE:-}"
 
 PREFILL_PORT="${PREFILL_PORT:-8200}"
@@ -59,17 +66,26 @@ PROXY_PORT="${PROXY_PORT:-8192}"
 PREFILL_SIDE_CHANNEL_PORT="${PREFILL_SIDE_CHANNEL_PORT:-5600}"
 DECODE_SIDE_CHANNEL_PORT="${DECODE_SIDE_CHANNEL_PORT:-5601}"
 NIXL_SIDE_CHANNEL_HOST="${NIXL_SIDE_CHANNEL_HOST:-127.0.0.1}"
+PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 
 PREFILL_HOSTS="${PREFILL_HOSTS:-127.0.0.1}"
 DECODE_HOSTS="${DECODE_HOSTS:-127.0.0.1}"
+DECODE_HOST="${DECODE_HOST:-${DECODE_HOSTS%%,*}}"
 
-ATTENTION_CONFIG="${ATTENTION_CONFIG:-{\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}}"
+# Defaults live in their own variables.  Writing `"${VAR:-{...}}"` directly
+# closes the parameter expansion at the first `}`, so an override containing
+# braces (`{"a":1}`) came back with a stray trailing `}`.
+DEFAULT_ATTENTION_CONFIG='{"indexer_kv_dtype":"mxfp4","indexer_sparse_logits":true}'
+DEFAULT_PREFILL_SPEC_CONFIG='{"method":"dspark","num_speculative_tokens":1}'
+DEFAULT_DECODE_SPEC_CONFIG='{"method":"dspark","num_speculative_tokens":5}'
+
+ATTENTION_CONFIG="${ATTENTION_CONFIG:-$DEFAULT_ATTENTION_CONFIG}"
 # DSpark block5: the decode instance drafts 5 tokens per round; the prefill
 # instance only needs a legal (smaller) speculative config, matching the
 # upstream PD+SD harness convention.
-PREFILL_SPEC_CONFIG="${PREFILL_SPEC_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":1}}"
-DECODE_SPEC_CONFIG="${DECODE_SPEC_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":5}}"
+PREFILL_SPEC_CONFIG="${PREFILL_SPEC_CONFIG:-$DEFAULT_PREFILL_SPEC_CONFIG}"
+DECODE_SPEC_CONFIG="${DECODE_SPEC_CONFIG:-$DEFAULT_DECODE_SPEC_CONFIG}"
 
 ENABLE_GRAPHS="${ENABLE_GRAPHS:-0}"
 
@@ -82,15 +98,23 @@ export VLLM_SM90_FP4_INDEXER="${VLLM_SM90_FP4_INDEXER:-1}"
 export VLLM_SM90_FP8_BLOCK32_STATIC="${VLLM_SM90_FP8_BLOCK32_STATIC:-1}"
 export VLLM_SM90_MHC_SPLIT_H="${VLLM_SM90_MHC_SPLIT_H:-1}"
 
-GRAPHS_ARGS=()
-if [[ "$ENABLE_GRAPHS" == "1" ]]; then
-  # DSpark: target verifies 1 + dspark_block_size rows per request, draft
-  # proposes dspark_block_size. Buckets below cover both series.
-  BUCKETS="${BUCKETS:-6 12 18 24 30 36 48 60 72 90 120 162 216 288 384 480 576}"
-  GRAPHS_ARGS=(--cudagraph-capture-sizes $BUCKETS --max-cudagraph-capture-size 576)
-fi
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 log() { echo "[dsv41_dspark_pd] $*"; }
+
+# PIDs started by this invocation, killed on any exit -- including a failing
+# test under `set -e`, which previously skipped the cleanup block entirely.
+STARTED_PIDS=()
+cleanup() {
+  local pid
+  for pid in "${STARTED_PIDS[@]:-}"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${STARTED_PIDS[@]:-}"; do
+    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
 
 wait_for_http() {
   local url="$1" name="$2" deadline="${3:-3600}" elapsed=0
@@ -107,36 +131,60 @@ wait_for_http() {
   return 1
 }
 
-serve_args() {
-  local role="$1"
-  echo "--model ${MODEL_PATH} --served-model-name ${SERVED_NAME} \
---tensor-parallel-size ${TP} --enable-expert-parallel \
---max-model-len ${MAX_MODEL_LEN} --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION} \
---max-num-seqs ${MAX_NUM_SEQS} --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS} \
---attention-config ${ATTENTION_CONFIG}"
+# Common serve flags, as an array so JSON values and paths with spaces survive
+# shell word splitting.
+COMMON_ARGS=()
+GRAPH_ARGS=()
+common_args() {
+  COMMON_ARGS=(
+    --model "$MODEL_PATH"
+    --served-model-name "$SERVED_NAME"
+    --tensor-parallel-size "$TP"
+    --enable-expert-parallel
+    --max-model-len "$MAX_MODEL_LEN"
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --max-num-seqs "$MAX_NUM_SEQS"
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
+    --attention-config "$ATTENTION_CONFIG"
+  )
+  [ -n "$BLOCK_SIZE" ] && COMMON_ARGS+=(--block-size "$BLOCK_SIZE")
+
+  if [ "$ENABLE_GRAPHS" = "1" ]; then
+    # DSpark: target verifies 1 + dspark_block_size rows per request, draft
+    # proposes dspark_block_size. Buckets below cover both series.
+    BUCKETS="${BUCKETS:-6 12 18 24 30 36 48 60 72 90 120 162 216 288 384 480 576}"
+    local max_bucket=0 b
+    for b in $BUCKETS; do [ "$b" -gt "$max_bucket" ] && max_bucket=$b; done
+    GRAPH_ARGS=(
+      --cudagraph-capture-sizes $BUCKETS
+      --max-cudagraph-capture-size "$max_bucket"
+    )
+  else
+    # ENABLE_GRAPHS=0 must actually mean eager.  Only omitting the capture-size
+    # flags left vLLM free to pick its own defaults and capture anyway.
+    GRAPH_ARGS=(--enforce-eager)
+  fi
 }
 
 run_prefill() {
-  log "starting prefill instance on port ${PREFILL_PORT}"
+  common_args
+  log "starting prefill instance on port ${PREFILL_PORT} (graphs=$ENABLE_GRAPHS)"
   VLLM_NIXL_SIDE_CHANNEL_HOST="$NIXL_SIDE_CHANNEL_HOST" \
   VLLM_NIXL_SIDE_CHANNEL_PORT="$PREFILL_SIDE_CHANNEL_PORT" \
-  python3 -m vllm.entrypoints.openai.api_server \
-    $(serve_args prefill) \
-    ${GRAPHS_ARGS[@]+"${GRAPHS_ARGS[@]}"} \
-    ${BLOCK_SIZE:+--block-size "$BLOCK_SIZE"} \
+  "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
+    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}" \
     --port "$PREFILL_PORT" \
     --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}' \
     --speculative-config "$PREFILL_SPEC_CONFIG"
 }
 
 run_decode() {
-  log "starting decode instance on port ${DECODE_PORT}"
+  common_args
+  log "starting decode instance on port ${DECODE_PORT} (graphs=$ENABLE_GRAPHS)"
   VLLM_NIXL_SIDE_CHANNEL_HOST="$NIXL_SIDE_CHANNEL_HOST" \
   VLLM_NIXL_SIDE_CHANNEL_PORT="$DECODE_SIDE_CHANNEL_PORT" \
-  python3 -m vllm.entrypoints.openai.api_server \
-    $(serve_args decode) \
-    ${GRAPHS_ARGS[@]+"${GRAPHS_ARGS[@]}"} \
-    ${BLOCK_SIZE:+--block-size "$BLOCK_SIZE"} \
+  "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
+    "${COMMON_ARGS[@]}" "${GRAPH_ARGS[@]}" \
     --port "$DECODE_PORT" \
     --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}' \
     --speculative-config "$DECODE_SPEC_CONFIG"
@@ -146,8 +194,9 @@ run_proxy() {
   local p_hosts=() d_hosts=()
   IFS=',' read -r -a p_hosts <<< "$PREFILL_HOSTS"
   IFS=',' read -r -a d_hosts <<< "$DECODE_HOSTS"
-  log "starting toy proxy on port ${PROXY_PORT}"
-  python3 "${GIT_ROOT}/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
+  log "starting toy proxy on ${PROXY_HOST}:${PROXY_PORT}"
+  "$PYTHON_BIN" "${SCRIPT_DIR}/toy_proxy_server.py" \
+    --host "$PROXY_HOST" \
     --port "$PROXY_PORT" \
     --prefiller-hosts "${p_hosts[@]}" \
     --prefiller-ports "$PREFILL_PORT" \
@@ -156,15 +205,19 @@ run_proxy() {
 }
 
 run_test() {
-  local p_host="${PREFILL_HOSTS%%,*}"
-  log "running DSpark PD acceptance test through the proxy"
+  # Every one of these must be its own shell word.  Quoting the whole command
+  # (`"${PYTEST:-python3 -m pytest} ..."`) made bash look for a single
+  # executable whose name contained every argument, which exits 127.
+  log "running DSpark PD acceptance test (proxy=${SERVER_HOST}:${PROXY_PORT}, decode metrics=${DECODE_HOST}:${DECODE_PORT})"
   SERVER_HOST="$SERVER_HOST" \
+  PROXY_HOST="$PROXY_HOST" \
   PROXY_PORT="$PROXY_PORT" \
+  DECODE_HOST="$DECODE_HOST" \
   DECODE_PORT="$DECODE_PORT" \
   TEST_MODEL="$SERVED_NAME" \
   DSV41_DSPARK_REFERENCE="${DSV41_DSPARK_REFERENCE:-}" \
-  "${PYTEST:-python3 -m pytest} -s -x ${GIT_ROOT}/tests/v1/kv_connector/nixl_integration/test_dsv41_dspark_pd.py"
-  : "$p_host"
+  DSV41_STRICT_REFERENCE="${DSV41_STRICT_REFERENCE:-0}" \
+  "$PYTHON_BIN" -m pytest -s -x "${SCRIPT_DIR}/test_dsv41_dspark_pd.py"
 }
 
 case "$ROLE" in
@@ -172,15 +225,28 @@ case "$ROLE" in
   decode)  run_decode ;;
   proxy)   run_proxy ;;
   test)    run_test ;;
+  # Machine-readable resolution of the serve flags, for the harness'
+  # self-test: it exercises the JSON defaults/overrides and the eager/graph
+  # branch without needing a GPU or a model.
+  print-config)
+    common_args
+    printf 'ATTENTION_CONFIG=%s\n' "$ATTENTION_CONFIG"
+    printf 'PREFILL_SPEC_CONFIG=%s\n' "$PREFILL_SPEC_CONFIG"
+    printf 'DECODE_SPEC_CONFIG=%s\n' "$DECODE_SPEC_CONFIG"
+    printf 'DECODE_HOST=%s\n' "$DECODE_HOST"
+    printf 'COMMON_ARGS_COUNT=%d\n' "${#COMMON_ARGS[@]}"
+    printf 'COMMON_ARGS=%s\n' "$(printf '%s\x1f' "${COMMON_ARGS[@]}")"
+    printf 'GRAPH_ARGS_COUNT=%d\n' "${#GRAPH_ARGS[@]}"
+    printf 'GRAPH_ARGS=%s\n' "$(printf '%s\x1f' "${GRAPH_ARGS[@]}")"
+    ;;
   all)
-    run_prefill & PREFILL_PID=$!
-    run_decode  & DECODE_PID=$!
+    run_prefill & STARTED_PIDS+=($!)
+    run_decode  & STARTED_PIDS+=($!)
     wait_for_http "http://${SERVER_HOST}:${PREFILL_PORT}/health" "prefill"
     wait_for_http "http://${SERVER_HOST}:${DECODE_PORT}/health" "decode"
-    run_proxy & PROXY_PID=$!
-    wait_for_http "http://${SERVER_HOST}:${PROXY_PORT}/healthcheck" "proxy" 120
+    run_proxy & STARTED_PIDS+=($!)
+    wait_for_http "http://${PROXY_HOST}:${PROXY_PORT}/healthcheck" "proxy" 120
     run_test
-    kill "$PREFILL_PID" "$DECODE_PID" "$PROXY_PID" 2>/dev/null || true
     ;;
   *) echo "unknown ROLE=$ROLE (prefill|decode|proxy|test|all)" >&2; exit 2 ;;
 esac
