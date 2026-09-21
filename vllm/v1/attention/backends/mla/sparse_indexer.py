@@ -17,6 +17,9 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+    has_sm90_fp4_indexer,
+)
 from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
     check_deep_select_layout,
     has_deep_select,
@@ -113,16 +116,39 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
                 "(attention_config.indexer_kv_dtype='mxfp4'): the sparse kernels "
                 "take UE8M0-packed granularity-32 scales."
             )
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
-        ):
-            raise ValueError(f"{prefix} requires an SM100-class GPU.")
-        if not has_deep_gemm_sparse_mqa():
-            raise ValueError(
-                f"{prefix} requires DeepGEMM >= 2.8 "
-                "(fp8_fp4_sparse_mqa_logits not found)."
-            )
+        use_sm90 = has_sm90_fp4_indexer()
+        if use_sm90:
+            # family(90): Triton MXFP4 logits kernels plus vLLM's existing fp32
+            # decode top-k. DeepGEMM's sparse kernels and DeepSelect are
+            # SM100-only and stay mandatory there.
+            if not current_platform.is_cuda():
+                raise ValueError(f"{prefix} SM90 path requires a CUDA platform.")
+            topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
+            if topk_backend not in ("auto", "cooperative", "persistent", "per_row"):
+                raise ValueError(
+                    f"{prefix} on family(90) uses vLLM's fp32 indexer top-k; "
+                    f"kernel_config.sparse_indexer_topk_backend='{topk_backend}' "
+                    "is not supported."
+                )
+            # The ported SM90 compact kernels are written against the same
+            # per-row (varlen) decode layout as the SM100 path: a per-row
+            # ``block_table`` plus a per-row compressed context length. Opt
+            # this builder instance into it explicitly. The global predicate
+            # ``_supports_varlen_paged_mqa_logits()`` stays SM100-only, so the
+            # dense SM90 metadata, its CUDA-graph support and the flattening
+            # decisions are untouched.
+            self.supports_varlen = True
+        else:
+            if not (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability_family(100)
+            ):
+                raise ValueError(f"{prefix} requires an SM100-class GPU.")
+            if not has_deep_gemm_sparse_mqa():
+                raise ValueError(
+                    f"{prefix} requires DeepGEMM >= 2.8 "
+                    "(fp8_fp4_sparse_mqa_logits not found)."
+                )
         if self.dcp_world_size > 1 or self.use_pcp:
             raise NotImplementedError(
                 f"{prefix} is not supported with decode/prefill context parallel."
@@ -131,20 +157,21 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
             raise ValueError(
                 f"{prefix} requires the varlen paged MQA logits decode layout."
             )
-        # The top-k runs on the kernels' bf16 logits with DeepSelect; there is
-        # no fp32 fallback, so the other top-k backends cannot be honored.
-        topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
-        if not has_deep_select():
-            raise ValueError(
-                f"{prefix} requires the DeepSelect top-k extension "
-                "(vllm._deepselect_C) for this GPU."
-            )
-        if topk_backend not in ("auto", "deep_select"):
-            raise ValueError(
-                f"{prefix} uses DeepSelect for the top-k; "
-                f"kernel_config.sparse_indexer_topk_backend='{topk_backend}' "
-                "is not supported with it."
-            )
+        if not use_sm90:
+            # The top-k runs on the kernels' bf16 logits with DeepSelect; there
+            # is no fp32 fallback, so the other top-k backends cannot be honored.
+            topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
+            if not has_deep_select():
+                raise ValueError(
+                    f"{prefix} requires the DeepSelect top-k extension "
+                    "(vllm._deepselect_C) for this GPU."
+                )
+            if topk_backend not in ("auto", "deep_select"):
+                raise ValueError(
+                    f"{prefix} uses DeepSelect for the top-k; "
+                    f"kernel_config.sparse_indexer_topk_backend='{topk_backend}' "
+                    "is not supported with it."
+                )
         self.sparse_block_kv = pick_sparse_block_kv(candidate_block_size)
         if kv_cache_spec.block_size % self.sparse_block_kv != 0:
             raise ValueError(
@@ -155,7 +182,8 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
             candidate_block_size // self.sparse_block_kv
         )
         num_sparse_cols = self.num_sparse_blocks * self.sparse_block_kv
-        check_deep_select_layout(num_sparse_cols, topk_tokens)
+        if not use_sm90:
+            check_deep_select_layout(num_sparse_cols, topk_tokens)
         # Sparse logits are bf16 [rows, num_sparse_cols]; make the prefill
         # chunker (which budgets fp32 [rows, seq_len]) size chunks as if every
         # row were this wide.
@@ -173,8 +201,9 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
         self.zero_row_ks = torch.zeros(max_rows, **int32)
         logger.info_once(
             "DeepSeek V4.1 indexer: candidate consumers score only the candidate "
-            "blocks with DeepGEMM sparse MQA logits (%d sparse blocks of %d "
-            "tokens per row).",
+            "blocks with %s (%d sparse blocks of %d tokens per row).",
+            "SM90 Triton MXFP4 logits" if use_sm90
+            else "DeepGEMM sparse MQA logits",
             self.num_sparse_blocks,
             self.sparse_block_kv,
         )

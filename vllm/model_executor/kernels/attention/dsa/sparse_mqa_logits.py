@@ -23,6 +23,11 @@ import importlib.util
 
 import torch
 
+from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+    has_sm90_fp4_indexer,  # noqa: F401  (re-exported for callers)
+    sm90_fp4_paged_index_logits,
+    sm90_fp4_workspace_index_logits,
+)
 from vllm.model_executor.layers.indexer_topk import (
     deep_select_topk,
     get_deep_select_stride_requirement,
@@ -47,6 +52,67 @@ def has_deep_select() -> bool:
         and current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
     )
+
+
+def sm90_sparse_mqa_logits_paged_decode(
+    q_values: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    candidate_block_size: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Candidate-token logits for the SM90 compact decode path.
+
+    Thin dispatch over :func:`sm90_fp4_paged_index_logits`: scores only the
+    published candidate blocks straight out of the paged MXFP4 indexer cache
+    and returns the token-level logits (the block scores are unused here).
+    """
+    logits, _ = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        candidate_block_size,
+        page_size,
+    )
+    return logits
+
+
+def sm90_sparse_mqa_logits_prefill_chunk(
+    q_values: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_values: torch.Tensor,
+    k_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    candidate_block_size: int,
+) -> torch.Tensor:
+    """Candidate-token logits for one SM90 compact prefill chunk.
+
+    Uses the same packed K gather workspace as the DeepGEMM path, so prefill
+    needs no new gather.
+    """
+    logits, _ = sm90_fp4_workspace_index_logits(
+        q_values,
+        q_scale,
+        weights,
+        k_values,
+        k_scales,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        candidate_blocks,
+        candidate_block_size,
+    )
+    return logits
 
 
 def check_deep_select_layout(num_sparse_cols: int, topk_tokens: int) -> None:

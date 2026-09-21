@@ -16,6 +16,9 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+    has_sm90_fp4_indexer,
+)
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -1252,6 +1255,16 @@ class DeepseekV4Indexer(nn.Module):
 
         # Candidate consumers can score only the candidate blocks (opt-in);
         # the candidate source and pre-candidate indexers stay dense.
+        if (
+            vllm_config.attention_config.indexer_sparse_logits
+            and current_platform.is_device_capability_family(90)
+            and not has_sm90_fp4_indexer()
+        ):
+            raise ValueError(
+                "attention_config.indexer_sparse_logits on family(90) requires "
+                "VLLM_SM90_FP4_INDEXER=1: the SM90 MXFP4 Triton logits kernels "
+                "replace the SM100-only DeepGEMM sparse path."
+            )
         use_sparse_logits = (
             vllm_config.attention_config.indexer_sparse_logits
             and candidate_block_buffer is not None

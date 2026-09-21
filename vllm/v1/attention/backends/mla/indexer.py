@@ -10,6 +10,9 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+    has_sm90_fp4_indexer,
+)
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -64,11 +67,15 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
             f"sparse indexer (expected one of {DSA_INDEXER_KV_DTYPES})."
         )
     use_fp4 = kv_dtype == "mxfp4"
-    if use_fp4 and not current_platform.is_device_capability_family(100):
+    if use_fp4 and not (
+        current_platform.is_device_capability_family(100)
+        or (current_platform.is_device_capability_family(90) and has_sm90_fp4_indexer())
+    ):
         raise ValueError(
             "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
-            "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
-            "earlier architectures are not supported."
+            "(sm_10x, e.g. B200/GB200), or family(90) (H100/H200) with "
+            "VLLM_SM90_FP4_INDEXER=1; sm_120 (consumer Blackwell) and earlier "
+            "architectures are not supported."
         )
     return use_fp4
 
@@ -1561,9 +1568,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
+            # DeepGEMM is required for the paged MQA logits on CUDA devices.
+            # Its varlen schedule builder is SM100-only (`attention.hpp`: the
+            # `indices` branch asserts `arch_major == 10`). A builder may opt
+            # into the varlen layout without DeepGEMM -- the SM90 compact
+            # indexer scores with its own Triton kernels and ignores this
+            # metadata -- so skip the DeepGEMM call there. Every other path
+            # keeps the exact condition it had: non-varlen builders always
+            # satisfy `not self.supports_varlen`, and the SM100 varlen builder
+            # satisfies the second term.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and (not self.supports_varlen or _supports_varlen_paged_mqa_logits())
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

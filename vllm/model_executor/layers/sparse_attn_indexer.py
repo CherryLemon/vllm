@@ -20,6 +20,11 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
+from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+    has_sm90_fp4_indexer,
+    sm90_fp4_paged_index_logits,
+    sm90_fp4_workspace_index_logits,
+)
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
     get_indexer_topk,
@@ -580,14 +585,29 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                     )
                 else:
-                    logits = fp8_fp4_mqa_logits(
-                        (q_slice_cast, q_scale_slice),
-                        (k_quant_cast, k_scale_cast),
-                        weights[chunk.token_start : chunk.token_end],
-                        cu_seqlen_ks,
-                        cu_seqlen_ke,
-                        clean_logits=False,
-                    )
+                    if use_fp4_cache and has_sm90_fp4_indexer():
+                        # Hopper: DeepGEMM's FP4 mqa-logits kernel is SM100-only,
+                        # so score the same packed K gather workspace with the
+                        # SM90 Triton kernel. k_quant / k_scale are already the
+                        # uint8 packed MXFP4 values + UE8M0 bytes.
+                        logits = sm90_fp4_workspace_index_logits(
+                            q_slice,
+                            q_scale_slice,
+                            weights[chunk.token_start : chunk.token_end],
+                            k_quant,
+                            k_scale,
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                        )
+                    else:
+                        logits = fp8_fp4_mqa_logits(
+                            (q_slice_cast, q_scale_slice),
+                            (k_quant_cast, k_scale_cast),
+                            weights[chunk.token_start : chunk.token_end],
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                            clean_logits=False,
+                        )
                 num_rows = logits.shape[0]
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source
@@ -640,6 +660,9 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
+        # The SM90 kernels read the raw 3D paged cache (page stride + the
+        # segregated payload/scale regions); DeepGEMM wants the 4D quant view.
+        kv_cache_3d = kv_cache
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         # requires_padding can be computed False for ragged warmup/mixed
@@ -723,17 +746,45 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-                indices=decode_metadata.indices,
-            )
+            if use_fp4_cache and has_sm90_fp4_indexer():
+                # Hopper: DeepGEMM's FP4 paged mqa-logits kernel is SM100-only.
+                # The SM90 Triton kernel takes the packed MXFP4 Q and reads the
+                # raw 3D cache (RATIO == 1 slot formula).
+                if next_n != 1:
+                    raise NotImplementedError(
+                        "the SM90 FP4 indexer supports one query per decode "
+                        "row (next_n == 1); native spec decode needs an SM90 "
+                        "kernel variant."
+                    )
+                sm90_block_table = decode_metadata.block_table
+                if sm90_block_table.shape[0] != num_padded_tokens:
+                    sm90_block_table = sm90_block_table.repeat_interleave(
+                        next_n, dim=0
+                    )[:num_padded_tokens]
+                logits = sm90_fp4_paged_index_logits(
+                    padded_q_quant_decode_tokens.reshape(
+                        num_padded_tokens, *q_quant.shape[1:]
+                    ),
+                    padded_q_scale.reshape(num_padded_tokens, q_scale.shape[-1]),
+                    kv_cache_3d,
+                    weights[:num_padded_tokens],
+                    seq_lens.reshape(-1)[:num_padded_tokens].contiguous(),
+                    sm90_block_table,
+                    page_size=kv_cache_3d.shape[1],
+                    width=max_model_len,
+                )
+            else:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                    indices=decode_metadata.indices,
+                )
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
