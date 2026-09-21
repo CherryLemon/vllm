@@ -620,6 +620,9 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
+    spec_group_size: int = 1
+    """1, or 6 on an admitted DSpark static target-verify step.  The SM90
+    paged-FP4 kernel groups ``spec_group_size`` consecutive rows per CTA."""
 
 
 @dataclass
@@ -837,6 +840,26 @@ def _sm90_fp4_indexer_active(vllm_config: VllmConfig) -> bool:
     return dsa_indexer_uses_fp4(vllm_config) and has_sm90_fp4_indexer()
 
 
+def _sm90_dspark_group6_active(vllm_config: VllmConfig) -> bool:
+    """Whether the builder should publish the group-6 row->request map.
+
+    Group-6 reuses one decoded K tile across the six flattened verification
+    rows of a request, so it *requires* flattening -- do not turn
+    ``_sm90_fp4_indexer_active`` off to "enable" it.  This predicate only
+    decides whether the builder spends the extra tiny kernel that maps each
+    flattened row back to its request; the kernel still checks request
+    equality on device on every replay.
+    """
+    spec = vllm_config.speculative_config
+    return (
+        _sm90_fp4_indexer_active(vllm_config)
+        and bool(envs.VLLM_SM90_FP4_GROUP6)
+        and spec is not None
+        and spec.use_dspark()
+        and spec.num_speculative_tokens == 5  # 1 + 5 = 6 verification rows
+    )
+
+
 def _use_flattening(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     next_n = 1 + vllm_config.num_speculative_tokens
@@ -886,6 +909,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # SM90 FP4 indexer capabilities (one query per row) are declared here,
         # not inherited from the SM100 DeepGEMM kernel's tables.
         self.sm90_fp4_indexer = _sm90_fp4_indexer_active(self.vllm_config)
+        # DSpark static target-verify group-6 K reuse (opt-in, default off).
+        self.sm90_group6 = _sm90_dspark_group6_active(self.vllm_config)
 
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
@@ -1538,6 +1563,28 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                 )
 
+            if self.sm90_group6 and not self.supports_varlen:
+                # The dense flatten path above has no row -> request map
+                # (``decode_indices`` is only published by the varlen branch).
+                # Group-6 needs it so the kernel can prove on device that a
+                # group of six flattened rows is one request.  The flattened
+                # row order is request-major (each request's ``decode_lens``
+                # tokens are contiguous), so the request of row ``t`` is the
+                # same binary search over ``query_start_loc`` the varlen kernel
+                # uses.  Cheap: one 256-wide block.
+                from vllm.v1.attention.ops.metadata import (
+                    _token_request_mapping_kernel,
+                )
+
+                _token_request_mapping_kernel[(triton.cdiv(num_decode_tokens, 256),)](
+                    common_attn_metadata.query_start_loc,
+                    self.decode_indices_buffer,
+                    num_decodes,
+                    num_decode_tokens,
+                    num_decode_tokens,
+                )
+                decode_indices = self.decode_indices_buffer[:num_decode_tokens]
+
             if self.compress_ratio > 1:
                 kernel_block_size = self.kernel_block_size
                 if (
@@ -1614,6 +1661,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
                 schedule_metadata[:] = metadata
 
+            # A "static" DSpark target-verify step is exactly next_n == 6
+            # uniform tokens per request with no row padding, i.e. every group
+            # of six consecutive flattened rows is one request.  The kernel
+            # re-checks request identity on device; this only selects the
+            # launch shape.  Default off: any admitted-step guard failing keeps
+            # ``spec_group_size == 1`` and the per-row kernel.
+            spec_group_size = 1
+            if (
+                self.sm90_group6
+                and not use_native
+                and min_decode_len == max_decode_len == 6
+                and num_decode_tokens == num_decodes * 6
+                and decode_indices is not None
+            ):
+                spec_group_size = 6
+
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
@@ -1625,6 +1688,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
                 decode_is_uniform=write_is_uniform,
                 write_max_decode_len=max_decode_len,
+                spec_group_size=spec_group_size,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

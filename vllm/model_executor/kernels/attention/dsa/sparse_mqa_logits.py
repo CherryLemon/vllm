@@ -64,6 +64,8 @@ def sm90_sparse_mqa_logits_paged_decode(
     candidate_blocks: torch.Tensor,
     candidate_block_size: int,
     page_size: int,
+    row_indices: torch.Tensor | None = None,
+    query_group_size: int = 1,
 ) -> torch.Tensor:
     """Candidate-token logits for the SM90 compact decode path.
 
@@ -72,6 +74,14 @@ def sm90_sparse_mqa_logits_paged_decode(
     and returns the token-level logits.  The candidate ids are already known
     on this path, so the per-block score reduction is skipped
     (``write_candidates=False``) -- nothing consumes it.
+
+    ``row_indices``/``query_group_size`` enable the group-6 K-reuse kernel for
+    the six flattened verification rows of one request (see
+    ``sm90_fp4_paged_index_logits``).  This compact grouping is an extension
+    beyond the SGLang reference, which groups only the dense candidate-source
+    pass; it is exact because the grouped kernel additionally requires all six
+    rows' candidate block ids to agree per tile, and falls back per row
+    otherwise.
     """
     return sm90_fp4_paged_index_logits(
         q_values,
@@ -84,6 +94,8 @@ def sm90_sparse_mqa_logits_paged_decode(
         candidate_block_size,
         page_size,
         write_candidates=False,
+        row_indices=row_indices,
+        query_group_size=query_group_size,
     )
 
 

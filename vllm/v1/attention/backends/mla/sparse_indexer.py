@@ -64,6 +64,8 @@ class SparseMQARowsMetadata:
     row_indices: torch.Tensor | None = None
     """Decode only: [rows] row -> request index."""
     kernel_metadata: torch.Tensor | None = None
+    spec_group_size: int = 1
+    """Row-group size for the SM90 group-6 K-reuse kernel (1 or 6)."""
 
 
 @dataclass
@@ -257,6 +259,7 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
                     if decode.indices is not None
                     else self.arange_buffer[:rows]
                 ),
+                spec_group_size=getattr(decode, "spec_group_size", 1),
             )
         if base.prefill is not None:
             metadata.sparse_prefill = [

@@ -247,6 +247,48 @@ def test_dspark_block5_next_n_matches_block_size(monkeypatch):
     assert indexer_mod._use_flattening(cfg) is True
 
 
+def test_dspark_group6_capability_gating(monkeypatch):
+    """Group-6 needs the opt-in flag, DSpark, and the block5 (next_n == 6) shape.
+
+    The predicate only decides whether the builder publishes the flattened
+    row->request map; the kernel still re-checks request identity on device.
+    Turning it on never un-flattens the SM90 FP4 decode path.
+    """
+    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: True)
+
+    def _cfg(num_speculative_tokens=5, method="dspark"):
+        return SimpleNamespace(
+            attention_config=SimpleNamespace(
+                resolve_indexer_kv_dtype=lambda default: "mxfp4"
+            ),
+            speculative_config=SimpleNamespace(
+                use_dspark=lambda: method == "dspark",
+                num_speculative_tokens=num_speculative_tokens,
+            ),
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", False)
+    assert indexer_mod._sm90_dspark_group6_active(_cfg()) is False
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    assert indexer_mod._sm90_dspark_group6_active(_cfg()) is True
+    # Block size other than 5 -> next_n != 6 -> no group.
+    assert indexer_mod._sm90_dspark_group6_active(_cfg(4)) is False
+    # Not DSpark.
+    assert indexer_mod._sm90_dspark_group6_active(_cfg(method="mtp")) is False
+    # No speculative config at all.
+    no_spec = _cfg()
+    no_spec.speculative_config = None
+    assert indexer_mod._sm90_dspark_group6_active(no_spec) is False
+    # Group-6 requires the SM90 FP4 path; it never flips flattening off.
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: False)
+    assert indexer_mod._sm90_dspark_group6_active(_cfg()) is False
+    monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: True)
+    assert indexer_mod._use_flattening(_cfg()) is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_reserve_workspaces_claims_overlap_in_lifetime(monkeypatch):
     """The logits and top-k scratch reservations must be live together.

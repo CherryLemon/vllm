@@ -49,6 +49,13 @@ _BLOCK_L = 64
 # tl.dot needs H >= 16; H is 32 (V4.1 index_n_heads) or 64.
 _NUM_WARPS = 4
 
+# Rows grouped per CTA by the group-6 K-reuse kernel (DSpark static target
+# verification: 1 draft bonus + 5 drafted tokens = 6 query rows per request).
+# ``_GROUP6_PGROUP`` is only the power-of-two lane count for the in-kernel
+# ``tl.arange``; the ``offset < GROUP`` mask restricts the group to six rows.
+_GROUP6 = 6
+_GROUP6_PGROUP = 8
+
 
 def has_sm90_fp4_indexer() -> bool:
     """True on family(90) CUDA when ``VLLM_SM90_FP4_INDEXER`` is enabled.
@@ -286,6 +293,349 @@ def _sm90_fp4_paged_index_logits_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Decode: group-6 K reuse (DSpark static target verification)
+# ---------------------------------------------------------------------------
+#
+# DSpark drafts ``dspark_block_size`` (5) tokens, so the target verifies
+# 1 + 5 = 6 query rows per request.  The per-row kernel above decodes the same
+# MXFP4 K tile six times, once per row.  These helpers share one decode across
+# the six same-request rows of a group: the K tile is loaded once at the group
+# *maximum* visible length and each row applies its own visibility mask.  Each
+# query keeps its own packed Q load and its own per-head MMA/reduction layout,
+# so the bf16 rounding chain is byte-identical to six independent per-row
+# calls.  Request identity (and, in compact mode, per-tile candidate-row
+# equality) is checked on device; any failure falls back to per-row K reloads.
+#
+# The reference (SGLang ``_fp4_index_logits_grouped_kernel``) groups only the
+# dense/logical candidate-source pass.  The compact variant here is a labelled
+# extension: its shared tile is exact only when all six rows map the tile's
+# compact columns to the same logical positions, hence the tile-local candidate
+# id equality guard below.
+
+
+@triton.jit
+def _sm90_fp4_group_load_keys(
+    cache_ptr,
+    block_table_ptr,
+    candidate_blocks_ptr,
+    leader_row,
+    n_vis,
+    width,
+    page_size,
+    page_stride,
+    stride_bt,
+    stride_cb,
+    USE_CANDIDATES: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    """Decode one K tile, addressed by logical position or compact column.
+
+    ``leader_row`` supplies the page table and (compact mode) the candidate
+    ids; ``n_vis`` is the tile's visibility bound (the group maximum for the
+    shared tile, the row's own length on the fallback path).  Returns the two
+    bf16 K halves plus the per-column ``logical`` position and ``col_valid``
+    (bounds/``-1`` only) so the caller can re-mask per row with a smaller
+    ``n_vis`` without re-deriving the coordinate space.
+    """
+    lb = tl.program_id(1)
+    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_i = tl.arange(0, HALF_D)
+    if USE_CANDIDATES:
+        # Compact mode: ``offs_l`` indexes the candidate *matrix* column, so it
+        # is bounded by the stored row width; visibility is a property of the
+        # mapped logical position (see the per-row kernel's contract).
+        block_col = offs_l // CANDIDATE_BLOCK_SIZE
+        within = offs_l % CANDIDATE_BLOCK_SIZE
+        block = tl.load(
+            candidate_blocks_ptr + leader_row * stride_cb + block_col,
+            mask=offs_l < width,
+            other=-1,
+        )
+        logical = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
+        col_valid = (offs_l < width) & (block >= 0)
+    else:
+        # Dense mode: ``offs_l`` *is* the logical position.
+        logical = offs_l.to(tl.int64)
+        col_valid = offs_l < width
+    valid = col_valid & (logical < n_vis)
+    # RATIO == 1: slot = block_table[row, L // page_size] * page_size + L % page_size.
+    page_idx = tl.load(
+        block_table_ptr + leader_row * stride_bt + logical // page_size,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    slot = page_idx * page_size + (logical % page_size)
+    page = slot // page_size
+    off = slot % page_size
+    row_base = page * page_stride
+    pay = tl.load(
+        cache_ptr
+        + row_base[:, None]
+        + off[:, None] * _PAYLOAD_BYTES
+        + offs_i[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    exps = tl.load(
+        cache_ptr
+        + row_base[:, None]
+        + page_size * _PAYLOAD_BYTES
+        + off[:, None] * _SCALE_BYTES
+        + (offs_i // 16)[None, :],
+        mask=valid[:, None],
+        other=127,
+    )
+    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    k_low = (_e2m1_decode(pay & 0x0F) * scale).to(tl.bfloat16)
+    k_high = (_e2m1_decode((pay >> 4) & 0x0F) * scale).to(tl.bfloat16)
+    return k_low, k_high, logical, col_valid
+
+
+@triton.jit
+def _sm90_fp4_group_score(
+    q_ptr,
+    qs_ptr,
+    w_ptr,
+    out_ptr,
+    k_low,
+    k_high,
+    logical,
+    col_valid,
+    row,
+    n_vis,
+    offs_l,
+    width,
+    stride_qr,
+    stride_qh,
+    stride_sr,
+    stride_sh,
+    stride_wr,
+    stride_out,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    """Score one row against the (possibly shared) K tile.
+
+    The masking predicate is the per-row kernel's, verbatim:
+    ``col_valid & (logical < n_vis)``.  In dense mode ``logical == offs_l`` and
+    ``col_valid == offs_l < width``, so this is ``offs_l < min(n_vis, width)``;
+    in compact mode ``logical`` is the mapped candidate position.
+    """
+    offs_h = tl.arange(0, H)
+    offs_i = tl.arange(0, HALF_D)
+    q_even, q_odd = _load_q_packed(
+        q_ptr,
+        qs_ptr,
+        row,
+        offs_h,
+        offs_i,
+        stride_qr,
+        stride_qh,
+        stride_sr,
+        stride_sh,
+        HALF_D,
+    )
+    logit = _score_heads(q_even, q_odd, k_low, k_high, w_ptr, row, offs_h, stride_wr)
+    valid = col_valid & (logical < n_vis)
+    logit = tl.where(valid, logit, float("-inf"))
+    tl.store(out_ptr + row * stride_out + offs_l, logit, mask=offs_l < width)
+
+
+@triton.jit
+def _sm90_fp4_group_invalid(
+    out_ptr, row, offs_l, width, stride_out, BLOCK_L: tl.constexpr
+):
+    """Write the fully invisible dense tile as ``-inf`` for one row."""
+    tl.store(
+        out_ptr + row * stride_out + offs_l,
+        tl.full([BLOCK_L], float("-inf"), tl.float32),
+        mask=offs_l < width,
+    )
+
+
+@triton.jit
+def _sm90_fp4_grouped_paged_index_logits_kernel(
+    q_ptr,
+    qs_ptr,
+    w_ptr,
+    cache_ptr,
+    block_table_ptr,
+    context_lens_ptr,
+    row_indices_ptr,
+    candidate_blocks_ptr,
+    out_ptr,
+    n_rows,
+    width,
+    page_size,
+    page_stride,
+    stride_qr,
+    stride_qh,
+    stride_sr,
+    stride_sh,
+    stride_wr,
+    stride_bt,
+    stride_cb,
+    stride_out,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    GROUP: tl.constexpr,
+    PGROUP: tl.constexpr,
+    USE_CANDIDATES: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
+):
+    first = tl.program_id(0) * GROUP
+    lb = tl.program_id(1)
+    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs = tl.arange(0, PGROUP)
+    rows = first + offs
+    gmask = (offs < GROUP) & (rows < n_rows)
+    lens = tl.load(context_lens_ptr + rows, mask=gmask, other=0)
+    max_n_vis = tl.max(lens, 0)
+
+    # Dense-only early exit: when the whole tile is invisible to every row the
+    # shared load would be all-masked anyway.  Compact columns are unordered
+    # and may legitimately extend past ``n_vis``, so there is no equivalent
+    # bound there (same reasoning as the per-row kernel's compact mask).
+    # Keep the constexpr gate separate from the runtime bound: ``USE_CANDIDATES``
+    # is compile-time and must not force the runtime comparison into a Tensor.
+    if not USE_CANDIDATES:  # noqa: SIM102
+        if lb * BLOCK_L >= tl.minimum(max_n_vis, width):
+            for j in tl.range(0, GROUP, loop_unroll_factor=1):
+                b = first + j
+                if b < n_rows:
+                    _sm90_fp4_group_invalid(
+                        out_ptr, b, offs_l, width, stride_out, BLOCK_L
+                    )
+            return
+
+    # Request identity is checked on device on every replay: the six rows of a
+    # group must all belong to the leader's request, else the shared tile is
+    # wrong and the group falls back to per-row K reloads.
+    req0 = tl.load(row_indices_ptr + first)
+    # Masked lanes (a partial last group) never score, so their ``other`` value
+    # only needs to not match a real leader id spuriously: ``0`` is safe either
+    # way (a spurious mismatch merely forces the per-row fallback).
+    reqs = tl.load(row_indices_ptr + rows, mask=gmask, other=0)
+    share = tl.sum((reqs != req0).to(tl.int32), 0) == 0
+
+    if USE_CANDIDATES:
+        # Compact extension: the shared tile is exact only if every row maps
+        # this tile's compact columns to the same logical positions, i.e. their
+        # candidate block ids agree tile-locally.  Dense mode shares
+        # unconditionally because all six rows use the same page table.
+        n_tile_blocks: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
+        base_col = (lb * BLOCK_L) // CANDIDATE_BLOCK_SIZE
+        tids = tl.arange(0, n_tile_blocks)
+        cmask = (base_col + tids) < (width // CANDIDATE_BLOCK_SIZE)
+        lead = tl.load(
+            candidate_blocks_ptr + first * stride_cb + base_col + tids,
+            mask=cmask,
+            other=-1,
+        )
+        for j in tl.range(1, GROUP, loop_unroll_factor=1):
+            bj = first + j
+            if bj < n_rows:
+                other_ids = tl.load(
+                    candidate_blocks_ptr + bj * stride_cb + base_col + tids,
+                    mask=cmask,
+                    other=-1,
+                )
+                share = share & (tl.sum((other_ids != lead).to(tl.int32), 0) == 0)
+
+    if share:
+        k_low, k_high, logical, col_valid = _sm90_fp4_group_load_keys(
+            cache_ptr,
+            block_table_ptr,
+            candidate_blocks_ptr,
+            first,
+            max_n_vis,
+            width,
+            page_size,
+            page_stride,
+            stride_bt,
+            stride_cb,
+            USE_CANDIDATES,
+            CANDIDATE_BLOCK_SIZE,
+            BLOCK_L,
+            HALF_D,
+        )
+        for j in tl.range(0, GROUP, loop_unroll_factor=1):
+            b = first + j
+            if b < n_rows:
+                n_vis = tl.load(context_lens_ptr + b)
+                _sm90_fp4_group_score(
+                    q_ptr,
+                    qs_ptr,
+                    w_ptr,
+                    out_ptr,
+                    k_low,
+                    k_high,
+                    logical,
+                    col_valid,
+                    b,
+                    n_vis,
+                    offs_l,
+                    width,
+                    stride_qr,
+                    stride_qh,
+                    stride_sr,
+                    stride_sh,
+                    stride_wr,
+                    stride_out,
+                    H,
+                    HALF_D,
+                )
+    else:
+        # Mixed-request / partial / differing-candidate group: reload per row,
+        # i.e. the existing one-row-per-CTA behaviour, never wrong.
+        for j in tl.range(0, GROUP, loop_unroll_factor=1):
+            b = first + j
+            if b < n_rows:
+                n_vis = tl.load(context_lens_ptr + b)
+                k_low, k_high, logical, col_valid = _sm90_fp4_group_load_keys(
+                    cache_ptr,
+                    block_table_ptr,
+                    candidate_blocks_ptr,
+                    b,
+                    n_vis,
+                    width,
+                    page_size,
+                    page_stride,
+                    stride_bt,
+                    stride_cb,
+                    USE_CANDIDATES,
+                    CANDIDATE_BLOCK_SIZE,
+                    BLOCK_L,
+                    HALF_D,
+                )
+                _sm90_fp4_group_score(
+                    q_ptr,
+                    qs_ptr,
+                    w_ptr,
+                    out_ptr,
+                    k_low,
+                    k_high,
+                    logical,
+                    col_valid,
+                    b,
+                    n_vis,
+                    offs_l,
+                    width,
+                    stride_qr,
+                    stride_qh,
+                    stride_sr,
+                    stride_sh,
+                    stride_wr,
+                    stride_out,
+                    H,
+                    HALF_D,
+                )
+
+
+# ---------------------------------------------------------------------------
 # Prefill: packed (gathered) MXFP4 K workspace
 # ---------------------------------------------------------------------------
 
@@ -427,6 +777,8 @@ def sm90_fp4_paged_index_logits(
     width: int | None = None,
     ratio: int = 1,
     write_candidates: bool = True,
+    row_indices: torch.Tensor | None = None,
+    query_group_size: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Score decode rows against the paged MXFP4 indexer K cache on SM90.
 
@@ -452,6 +804,13 @@ def sm90_fp4_paged_index_logits(
             own their candidate ids (the compact decode path) do not read
             ``candidate_scores``/``candidate_lens``; pass ``False`` to skip the
             ``[rows, K]`` fp32 allocation and the in-kernel block reduction.
+        row_indices: ``[rows]`` int32 row -> request map.  Required (and only
+            used) when the group-6 K-reuse path is admitted; the grouped kernel
+            checks on device that a group's six rows share one request and
+            falls back to per-row K reloads when they do not.
+        query_group_size: Semantic hint from the caller, never inferred from
+            ``rows``: 6 on an admitted static DSpark target-verify step, 1
+            otherwise.  Any value other than 6 keeps the per-row grid.
 
     Returns:
         Dense/masked mode: ``[rows, width]`` fp32 logits, ``-inf`` outside
@@ -492,6 +851,20 @@ def sm90_fp4_paged_index_logits(
         num_blocks = 0
     write_candidates = use_candidates and write_candidates
 
+    # Group-6 K reuse.  Admission is explicit and conservative: the caller's
+    # semantic hint (never inferred from ``rows``), a full group (``rows % 6``),
+    # the opt-in env flag, and no in-kernel candidate-score output (the grouped
+    # kernel does not reduce block scores).  Request identity and, in compact
+    # mode, per-tile candidate-row equality are re-checked on device.  Any
+    # non-admitted step takes the existing one-row-per-CTA grid byte-for-byte.
+    use_grouped = (
+        query_group_size == _GROUP6
+        and row_indices is not None
+        and rows % _GROUP6 == 0
+        and not write_candidates
+        and bool(envs.VLLM_SM90_FP4_GROUP6)
+    )
+
     if rows == 0 or width == 0:
         logits = q_values.new_empty((rows, width), dtype=torch.float32)
         if write_candidates:
@@ -523,6 +896,53 @@ def sm90_fp4_paged_index_logits(
     else:
         cand = context_lens  # unused when USE_CANDIDATES is False
         stride_cb = 0
+
+    if use_grouped:
+        assert row_indices is not None
+        # The builder publishes ``decode_indices`` as int32 contiguous; the
+        # re-normalization is defensive (e.g. a test slicing a wider buffer).
+        if row_indices.dtype != torch.int32:
+            row_indices = row_indices.to(torch.int32)
+        if row_indices.stride(-1) != 1 or not row_indices.is_contiguous():
+            row_indices = row_indices.contiguous()
+        assert row_indices.shape[0] >= rows, (
+            f"row_indices has {row_indices.shape[0]} entries for {rows} rows"
+        )
+        grid = (triton.cdiv(rows, _GROUP6), triton.cdiv(width, _BLOCK_L))
+        _sm90_fp4_grouped_paged_index_logits_kernel[grid](
+            q_values,
+            q_scale_bytes,
+            weights,
+            cache,
+            block_table,
+            context_lens,
+            row_indices,
+            cand,
+            logits,
+            rows,
+            width,
+            page_size,
+            page_stride,
+            q_values.stride(0),
+            q_values.stride(1),
+            q_scale_bytes.stride(0),
+            q_scale_bytes.stride(1),
+            weights.stride(0),
+            block_table.stride(0),
+            stride_cb,
+            logits.stride(0),
+            H=heads,
+            HALF_D=INDEX_HEAD_DIM // 2,
+            BLOCK_L=_BLOCK_L,
+            GROUP=_GROUP6,
+            PGROUP=_GROUP6_PGROUP,
+            USE_CANDIDATES=use_candidates,
+            CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
+            num_warps=_NUM_WARPS,
+        )
+        # ``use_grouped`` requires ``not write_candidates``, so the grouped
+        # kernel never needs to also return block scores.
+        return logits
 
     grid = (rows, triton.cdiv(width, _BLOCK_L))
     _sm90_fp4_paged_index_logits_kernel[grid](

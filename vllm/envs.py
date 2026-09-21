@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SM90_FP4_INDEXER: bool = False
+    VLLM_SM90_FP4_GROUP6: bool = False
     VLLM_SM90_FP8_BLOCK32_STATIC: bool = False
     VLLM_SM90_MHC_SPLIT_H: bool = False
     VLLM_MHC_DISPATCH_STATS: bool = False
@@ -1099,6 +1100,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default off: SM100 keeps the DeepGEMM/DeepSelect path and family(90)
     # keeps the FP8 indexer cache.
     "VLLM_SM90_FP4_INDEXER": lambda: bool(int(os.getenv("VLLM_SM90_FP4_INDEXER", "0"))),
+    # Opt-in K-reuse grouping for the SM90 MXFP4 paged indexer kernel.  DSpark
+    # drafts ``dspark_block_size`` (5) tokens, so a static target-verify step
+    # carries 1 + 5 = 6 query rows per request.  When set (and the builder
+    # admits the uniform 6-row step), the six same-request rows of one group
+    # decode the MXFP4 K tile once instead of six times; request identity and
+    # (compact mode) candidate-row equality are checked on device, and every
+    # failed guard falls back to the existing one-row-per-CTA kernel.  Default
+    # off: the default launch shape and every non-admitted step are unchanged.
+    "VLLM_SM90_FP4_GROUP6": lambda: bool(int(os.getenv("VLLM_SM90_FP4_GROUP6", "0"))),
     # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM (WP B). Default
     # off: family(90) keeps the Marlin W8A16 fallback and SM100 is unchanged.
     "VLLM_SM90_FP8_BLOCK32_STATIC": lambda: bool(

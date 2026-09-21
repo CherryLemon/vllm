@@ -772,6 +772,10 @@ def sparse_attn_indexer(
                     sm90_block_table,
                     page_size=kv_cache_3d.shape[1],
                     width=max_model_len,
+                    row_indices=decode_metadata.indices,
+                    query_group_size=getattr(
+                        decode_metadata, "spec_group_size", 1
+                    ),
                 )
             else:
                 logits = fp8_fp4_paged_mqa_logits(

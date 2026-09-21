@@ -517,6 +517,466 @@ def test_compact_decode_dspark_block5_rows_are_independent():
         )
 
 
+# ---------------------------------------------------------------------------
+# Group-6 K reuse (DSpark static target-verify shape)
+# ---------------------------------------------------------------------------
+#
+# Admission is host-side (``query_group_size == 6`` + a full group + the opt-in
+# env flag); request identity and, in compact mode, per-tile candidate-row
+# equality are re-checked on device and fall back to per-row K reloads.  Every
+# test below uses the *existing* per-row kernel as the oracle and demands
+# ``rtol=0, atol=0``: the grouped kernel keeps each query's own packed Q load
+# and per-head MMA, so it must be bit-identical, not merely close.
+
+
+def _group6_dense_case(rows: int, n_vis: list[int], device, seed: int = 21):
+    """Shared dense setup: one request's ``rows`` verify queries, one page table."""
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    torch.manual_seed(seed)
+    heads = 32
+    page_size = PAGE_SIZE
+    num_blocks = 16
+    width = num_blocks * page_size
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    ).repeat(rows, 1)
+    context_lens = torch.tensor(n_vis, device=device, dtype=torch.int32)
+    return (
+        sm90_fp4_paged_index_logits,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    )
+
+
+@requires_sm90
+def test_group6_matches_per_row_dense(monkeypatch):
+    """A full group of six dense rows must equal six per-row calls bit-exactly."""
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 12  # two full groups
+    n_vis = [300, 260, 220, 180, 120, 0, 305, 250, 205, 150, 90, 1]
+    (
+        fn,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    ) = _group6_dense_case(rows, n_vis, device)
+    row_indices = torch.zeros(rows, device=device, dtype=torch.int32)
+
+    grouped = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    # The all-invisible row (n_vis == 0) is entirely -inf in both.
+    assert (grouped[5] == float("-inf")).all()
+    assert (grouped[11, 1:] == float("-inf")).all()
+
+
+@requires_sm90
+def test_group6_dense_spanning_two_requests_falls_back(monkeypatch):
+    """A group straddling two requests must fall back per row, never share K.
+
+    This is the sharpest silent-regression detector for the device-side request
+    identity guard: the row order is deliberately interleaved so every group
+    mixes requests.  If the guard were dropped, each non-leader row would score
+    against the leader's page table and differ from the per-row result.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    torch.manual_seed(31)
+    device = "cuda"
+    rows, heads, page_size = 12, 32, PAGE_SIZE
+    num_blocks = 32
+    width = 16 * page_size
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    # Request 0 owns blocks 0..15, request 1 owns 16..31.
+    block_table = torch.zeros((rows, 16), device=device, dtype=torch.int32)
+    block_table[:6, :16] = torch.arange(16, device=device, dtype=torch.int32)
+    block_table[6:, :16] = torch.arange(16, 32, device=device, dtype=torch.int32)
+    context_lens = torch.full((rows,), 8 * page_size, device=device, dtype=torch.int32)
+    # Interleaved request ids: every group mixes 0 and 1.
+    row_indices = torch.tensor(
+        [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1], device=device, dtype=torch.int32
+    )
+
+    grouped = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    # Sanity: the two requests really do read different K.
+    assert not torch.equal(per_row[0], per_row[1])
+
+
+@requires_sm90
+def test_group6_partial_group_and_padding(monkeypatch):
+    """Non-multiple-of-6 rows and padded/zero-visible rows stay exact.
+
+    ``rows == 4`` cannot form a full group, so admission fails and the existing
+    per-row grid runs; a six-row group whose last leader id is a padding
+    sentinel falls back in-kernel.  Both must be byte-identical to per-row.
+    """
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+
+    # (a) rows not a multiple of 6 -> host fallback.
+    rows = 4
+    (
+        _,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    ) = _group6_dense_case(rows, [120, 90, 60, 0], device, seed=41)
+    row_indices = torch.zeros(rows, device=device, dtype=torch.int32)
+    grouped = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+
+    # (b) full group, last row a padding sentinel -> in-kernel per-row fallback.
+    rows = 6
+    (
+        _,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    ) = _group6_dense_case(rows, [200, 150, 120, 90, 60, 0], device, seed=42)
+    row_indices = torch.tensor(
+        [0, 0, 0, 0, 0, 7], device=device, dtype=torch.int32
+    )
+    grouped = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    assert (grouped[5] == float("-inf")).all()
+
+
+@requires_sm90
+def test_group6_all_padding_zero_visible(monkeypatch):
+    """The all-invisible group takes the dense early exit and writes all -inf."""
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 6
+    (
+        _,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        width,
+    ) = _group6_dense_case(rows, [0] * rows, device, seed=43)
+    row_indices = torch.zeros(rows, device=device, dtype=torch.int32)
+    grouped = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = sm90_fp4_paged_index_logits(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        page_size=PAGE_SIZE,
+        width=width,
+    )
+    assert torch.equal(grouped, per_row)
+    assert (grouped == float("-inf")).all()
+
+
+def _group6_compact_case(rows: int, n_vis: list[int], device, seed: int = 51):
+    from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
+        sm90_fp4_paged_index_logits,
+    )
+
+    torch.manual_seed(seed)
+    heads = 32
+    page_size = PAGE_SIZE
+    num_blocks, cbs = 16, 8
+    candidates = [12, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1, -1]
+    width = len(candidates) * cbs
+    cache = _packed_cache(num_blocks, page_size, device)
+    q_values = _rand_q(rows, heads, device)
+    q_scale = _valid_q_scale(rows, heads, device)
+    weights = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+        1, -1
+    ).repeat(rows, 1)
+    context_lens = torch.tensor(n_vis, device=device, dtype=torch.int32)
+    candidate_blocks = torch.tensor(candidates, device=device, dtype=torch.int32)
+    candidate_blocks = candidate_blocks.reshape(1, -1).repeat(rows, 1)
+    return (
+        sm90_fp4_paged_index_logits,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        width,
+    )
+
+
+@requires_sm90
+def test_group6_matches_per_row_compact(monkeypatch):
+    """The compact extension must be exact when candidate rows agree per tile."""
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 6
+    (
+        fn,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        width,
+    ) = _group6_compact_case(rows, [100, 92, 77, 60, 33, 0], device)
+    row_indices = torch.zeros(rows, device=device, dtype=torch.int32)
+
+    grouped = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=PAGE_SIZE,
+        write_candidates=False,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=PAGE_SIZE,
+        write_candidates=False,
+    )
+    assert grouped.shape == (rows, width)
+    assert torch.equal(grouped, per_row)
+
+
+@requires_sm90
+def test_group6_compact_mixed_candidates_falls_back(monkeypatch):
+    """A compact tile whose candidate rows disagree must fall back per row."""
+    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
+    device = "cuda"
+    rows = 6
+    (
+        fn,
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        width,
+    ) = _group6_compact_case(rows, [100, 92, 77, 60, 33, 0], device)
+    # Rows 0..2 keep the shared candidates; rows 3..5 differ in the *second*
+    # block tile (block columns 8..15), so only that tile must fall back while
+    # the first tile can still be shared.
+    candidate_blocks[3:, 8:] = torch.tensor(
+        [11, 10, 9, 8, 7, 6, -1, -1], device=device, dtype=torch.int32
+    )
+    row_indices = torch.zeros(rows, device=device, dtype=torch.int32)
+
+    grouped = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=PAGE_SIZE,
+        write_candidates=False,
+        row_indices=row_indices,
+        query_group_size=6,
+    )
+    per_row = fn(
+        q_values,
+        q_scale,
+        cache,
+        weights,
+        context_lens,
+        block_table,
+        candidate_blocks,
+        cbs,
+        page_size=PAGE_SIZE,
+        write_candidates=False,
+    )
+    assert torch.equal(grouped, per_row)
+
+
+def test_group6_candidate_tile_guard_is_necessary():
+    """CPU form of the compact group guard (the kernel needs a GPU).
+
+    Two rows may share a decoded K tile only if their candidate ids agree
+    *tile-locally* (tile = ``BLOCK_L / cbs`` candidate blocks); otherwise the
+    same compact column maps to different logical positions and the shared K is
+    wrong.  Pins the guard's exact scope so it cannot be loosened to a
+    whole-row comparison.
+    """
+    cbs, block_l = 8, 64
+    blocks_per_tile = block_l // cbs
+    cols = torch.arange(2 * block_l)
+    base = torch.tensor([12, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1, -1])
+    other = base.clone()
+    # Differ only in the second tile's block columns.
+    other[blocks_per_tile : 2 * blocks_per_tile] = torch.tensor(
+        [11, 10, 9, 8, 7, 6, -1, -1]
+    )
+
+    logical_base = base[cols // cbs].to(torch.int64) * cbs + (cols % cbs)
+    logical_other = other[cols // cbs].to(torch.int64) * cbs + (cols % cbs)
+
+    tile0 = slice(0, block_l)
+    tile1 = slice(block_l, 2 * block_l)
+    # Tile 0 agrees: the shared tile is exact there.
+    assert torch.equal(logical_base[tile0], logical_other[tile0])
+    # Tile 1 disagrees: sharing it would score different logical positions.
+    assert not torch.equal(logical_base[tile1], logical_other[tile1])
+
+
 @requires_sm90
 def test_compact_decode_empty_and_single_row_shapes():
     """Padding-only batches must not fault or read out of bounds.

@@ -300,6 +300,8 @@ class SparseMQAIndexer(nn.Module):
                     cand,
                     cbs,
                     page_size,
+                    row_indices=decode.row_indices,
+                    query_group_size=getattr(decode, "spec_group_size", 1),
                 )
                 # Two different coordinate spaces meet here and must not be
                 # mixed:
