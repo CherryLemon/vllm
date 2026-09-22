@@ -117,13 +117,6 @@
 #   PREFILL_PROFILER_CONFIG / DECODE_PROFILER_CONFIG - JSON --profiler-config
 #                         for one role (empty = off).  Only the API server of the
 #                         profiled role exposes /start_profile and /stop_profile.
-#   VLLM_SM90_FP4_INDEXER / VLLM_SM90_FP8_BLOCK32_STATIC / VLLM_SM90_MHC_SPLIT_H
-#                       - (default 1) the ported SM90 kernels; exported into the
-#                         service environment, not just the caller's shell.
-#   VLLM_SM90_FP4_GROUP6 / VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES
-#                       - (default 0 = library default) the two kernels that are
-#                         only entered on specific shapes; an A/B has to set
-#                         them here so the worker's own environment shows it.
 #   ENABLE_GRAPHS       - 1 keeps CUDA graphs on (default 0 = --enforce-eager)
 #   BUCKETS             - capture sizes used when ENABLE_GRAPHS=1
 #   VLLM_SERVER_DEV_MODE - (default 1) exposes /reset_prefix_cache, which the
@@ -237,19 +230,6 @@ ENABLE_GRAPHS="${ENABLE_GRAPHS:-0}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 GIT_ROOT="${GIT_ROOT:-$(cd -- "${SCRIPT_DIR}/../../../.." && pwd -P)}"
 
-# Opt-in SM90 indexer/linear/mHC kernels. Default on for this harness: the
-# point is to exercise the ported paths.
-export VLLM_SM90_FP4_INDEXER="${VLLM_SM90_FP4_INDEXER:-1}"
-export VLLM_SM90_FP8_BLOCK32_STATIC="${VLLM_SM90_FP8_BLOCK32_STATIC:-1}"
-export VLLM_SM90_MHC_SPLIT_H="${VLLM_SM90_MHC_SPLIT_H:-1}"
-# These two keep the library default (off) unless the caller opts in.  They are
-# exported *explicitly* rather than left to the ambient shell: a flag that only
-# exists in the calling shell never reaches the container, and an A/B that
-# cannot prove which value the worker saw is not an A/B.  Both are echoed by
-# ROLE=print-config.
-export VLLM_SM90_FP4_GROUP6="${VLLM_SM90_FP4_GROUP6:-0}"
-export VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES="${VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES:-0}"
-
 # The acceptance test resets the decode instance's prefix cache between the PD
 # request and the local control (`POST /reset_prefix_cache?reset_external=true`)
 # so the two cannot share a cache entry.  That endpoint lives behind the dev
@@ -280,6 +260,8 @@ start_service() {
   local pidfile
   pidfile="$(_svc_pidfile "$name")"
   log "starting ${name} (pidfile ${pidfile})"
+  # The child shell expands its own PID and arguments.
+  # shellcheck disable=SC2016
   setsid bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' \
     _ "$pidfile" "$@" &
   SERVICE_PIDFILES+=("$pidfile")
@@ -410,9 +392,13 @@ common_args() {
     # proposes dspark_block_size. Buckets below cover both series.
     BUCKETS="${BUCKETS:-6 12 18 24 30 36 48 60 72 90 120 162 216 288 384 480 576}"
     local max_bucket=0 b
-    for b in $BUCKETS; do [ "$b" -gt "$max_bucket" ] && max_bucket=$b; done
+    local -a capture_buckets
+    read -r -a capture_buckets <<< "${BUCKETS//$'\n'/ }"
+    for b in "${capture_buckets[@]}"; do
+      [ "$b" -gt "$max_bucket" ] && max_bucket=$b
+    done
     GRAPH_ARGS=(
-      --cudagraph-capture-sizes $BUCKETS
+      --cudagraph-capture-sizes "${capture_buckets[@]}"
       --max-cudagraph-capture-size "$max_bucket"
     )
   else
@@ -653,12 +639,6 @@ case "$ROLE" in
     printf 'MOONCAKE_ABORT_REQUEST_TIMEOUT=%s\n' "$MOONCAKE_ABORT_REQUEST_TIMEOUT"
     printf 'MOONCAKE_DEVICE_NAME=%s\n' "$MOONCAKE_DEVICE_NAME"
     printf 'VLLM_SERVER_DEV_MODE=%s\n' "$VLLM_SERVER_DEV_MODE"
-    printf 'VLLM_SM90_FP4_INDEXER=%s\n' "$VLLM_SM90_FP4_INDEXER"
-    printf 'VLLM_SM90_FP8_BLOCK32_STATIC=%s\n' "$VLLM_SM90_FP8_BLOCK32_STATIC"
-    printf 'VLLM_SM90_MHC_SPLIT_H=%s\n' "$VLLM_SM90_MHC_SPLIT_H"
-    printf 'VLLM_SM90_FP4_GROUP6=%s\n' "$VLLM_SM90_FP4_GROUP6"
-    printf 'VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES=%s\n' \
-      "$VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"
     printf 'MAX_MODEL_LEN=%s\n' "$MAX_MODEL_LEN"
     printf 'PREFILL_PREFIX_CACHING=%s\n' "$PREFILL_PREFIX_CACHING"
     printf 'DECODE_PREFIX_CACHING=%s\n' "$DECODE_PREFIX_CACHING"

@@ -71,11 +71,18 @@ def _split_h_tensors(num_tokens: int, hidden: int, *, device=DEVICE):
 # ---------------------------------------------------------------------------
 
 
-def test_guard_rejects_when_feature_disabled(monkeypatch):
-    """Without the enable flag the split-H branch never claims an input."""
-    monkeypatch.setattr(mhc_tilelang, "has_sm90_mhc_split_h", lambda: False)
+@pytest.mark.parametrize(
+    "cuda,family,expected",
+    [(True, 90, True), (True, 100, False), (True, 120, False), (False, 90, False)],
+)
+def test_guard_checks_platform(monkeypatch, cuda, family, expected):
+    """Only Hopper CUDA devices select the split-H post kernel."""
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda fam: fam == family
+    )
     x, residual, post, comb = _split_h_tensors(2, SPLIT_H_HIDDEN, device="cpu")
-    assert not mhc_tilelang._mhc_post_split_h_supported(x, residual, post, comb)
+    assert mhc_tilelang._mhc_post_split_h_supported(x, residual, post, comb) is expected
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 64, 65, 240, 241])

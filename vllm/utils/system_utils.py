@@ -164,6 +164,48 @@ def _maybe_force_spawn():
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
+def sync_python_environ_to_process_environ() -> None:
+    """Publish ``os.environ`` into the C environment spawn actually inherits.
+
+    ``multiprocessing`` spawn (``spawnv_passfds`` → ``execve`` with ``env=None``)
+    copies the process C ``environ`` array, not Python's ``os.environ`` dict.
+    Those two diverge when C code ``unsetenv``s a key, or when the C array is
+    replaced by a tail of the original block: ``os.getenv`` in the parent still
+    returns the Python value, and ``/proc/<pid>/environ`` still shows the
+    original exec block, but the child is started without the key.
+
+    Assignment goes through ``setenv`` and inserts any key missing from the
+    live C array. Called immediately before spawn.
+    """
+    for key, value in list(os.environ.items()):
+        if not key or "=" in key or "\0" in key or "\0" in value:
+            continue
+        try:
+            os.environ[key] = value
+        except OSError:
+            logger.warning("Failed to republish environment variable %s", key)
+
+
+def _install_spawn_environ_sync() -> None:
+    """Make every ``spawn`` republish ``os.environ`` before ``execve``."""
+    import multiprocessing.util as mp_util
+
+    current = mp_util.spawnv_passfds
+    if getattr(current, "_vllm_environ_sync", False):
+        return
+    original = current
+
+    def spawnv_passfds(path, args, passfds):
+        sync_python_environ_to_process_environ()
+        return original(path, args, passfds)
+
+    spawnv_passfds._vllm_environ_sync = True  # type: ignore[attr-defined]
+    mp_util.spawnv_passfds = spawnv_passfds
+
+
+_install_spawn_environ_sync()
+
+
 def get_mp_context():
     """Get a multiprocessing context with a particular method (spawn or fork).
     By default we follow the value of the VLLM_WORKER_MULTIPROC_METHOD to

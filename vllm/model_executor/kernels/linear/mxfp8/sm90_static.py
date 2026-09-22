@@ -35,10 +35,8 @@ Everything else -- split-K partials shaped ``(SPLIT_K, M, N)`` plus the reduce
 kernel, the ``group_k`` scale stepping, the ``SWAP_AB`` accumulation order and
 the per-K32 ``tl.dot`` -- is a faithful port.
 
-Selection is **opt-in and default-off**; see ``Sm90StaticMxfp8LinearKernel``.
+Selected automatically on Hopper; see ``Sm90StaticMxfp8LinearKernel``.
 """
-
-import os
 
 import torch
 from torch.nn.parameter import Parameter
@@ -55,36 +53,14 @@ from vllm.platforms import current_platform
 # Use vLLM's tolerant Triton import: this module is pulled in unconditionally
 # by the public ``kernels.linear`` package (for the backend registry), so a
 # hard ``import triton`` would make the whole linear-kernel registry fail to
-# import on platforms/installs without Triton even when every SM90 opt-in flag
-# is off.  ``vllm.triton_utils`` substitutes a no-op placeholder when Triton is
-# unavailable, and ``is_supported()`` still gates the kernels on SM90.
+# import on platforms/installs without Triton. ``vllm.triton_utils`` substitutes
+# a no-op placeholder there; ``is_supported()`` still gates the kernels on SM90.
 from vllm.triton_utils import tl, triton
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 # Block size of the MXFP8 scale grid along K (and, on disk, along N).
 _MXFP8_BLOCK = 32
-
-# Explicit opt-in (VLLM_SM90_FP8_BLOCK32_STATIC, registered in vllm/envs.py).
-# Default off: existing Marlin/Emulation selection on SM90 is untouched unless
-# this is set. The raw environment is consulted as a fallback so the module also
-# works when imported before the env registry is populated.
-_SM90_STATIC_ENV = "VLLM_SM90_FP8_BLOCK32_STATIC"
-
-
-def _sm90_static_enabled() -> bool:
-    from vllm import envs
-
-    value = getattr(envs, _SM90_STATIC_ENV, None)
-    if value is not None:
-        return bool(value)
-    return os.environ.get(_SM90_STATIC_ENV, "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
 
 # ---------------------------------------------------------------------------
 # Tuned (N, K) -> {M: config} table.
@@ -103,6 +79,7 @@ def _sm90_static_enabled() -> bool:
 # The remaining table entries ((1536/1792/576, 5120), (16384, 1280),
 # (5120, 288), (5120, 4096)) cover the same family at other TP/sizes.
 # ---------------------------------------------------------------------------
+# fmt: off
 _SM90_STATIC_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
     (1280, 5120): {
         1: {
@@ -727,6 +704,7 @@ _SM90_STATIC_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
         },
     },
 }
+# fmt: on
 
 # For (N, K) without a tuned entry. SWAP_AB/SplitK are off: correctness first,
 # and any N is handled by the store mask.
@@ -937,8 +915,7 @@ def sm90_static_gemm(
     assert A.stride(-1) == 1, "A groups must be contiguous"
     assert As.dtype == torch.float32
     assert Bs.dtype == MXFP8_SCALE_DTYPE, (
-        f"SM90 static kernel expects {MXFP8_SCALE_DTYPE} weight_scale, "
-        f"got {Bs.dtype}"
+        f"SM90 static kernel expects {MXFP8_SCALE_DTYPE} weight_scale, got {Bs.dtype}"
     )
     M, K = A.shape
     N = B.shape[0]
@@ -1009,11 +986,10 @@ def _quantize_activation_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 class Sm90StaticMxfp8LinearKernel(Mxfp8LinearKernel):
     """Native W8A8 MXFP8 (block 32x32) GEMM on SM90 via the static Triton kernel.
 
-    Selection is opt-in and default-off. ``is_supported`` is true only on
-    family(90) CUDA with ``VLLM_SM90_FP8_BLOCK32_STATIC=1``, so ``auto`` keeps
-    selecting Marlin on SM90 and the SM100 entries on family(100). The kernel
-    class is also registered under the (intended) ``mxfp8_sm90_static``
-    ``--linear-backend`` key in ``kernels/linear/__init__.py``.
+    ``is_supported`` requires family(90) CUDA. Family(100) uses its own entries.
+    The kernel class is also registered under the (intended)
+    ``mxfp8_sm90_static`` ``--linear-backend`` key in
+    ``kernels/linear/__init__.py``.
     """
 
     supports_pre_processed_weights = True
@@ -1026,11 +1002,6 @@ class Sm90StaticMxfp8LinearKernel(Mxfp8LinearKernel):
             return False, "SM90 static MXFP8 requires CUDA"
         if not current_platform.is_device_capability_family(90):
             return False, "SM90 static MXFP8 requires SM90 (Hopper)"
-        if not _sm90_static_enabled():
-            return False, (
-                f"set {_SM90_STATIC_ENV}=1 to enable the native SM90 MXFP8 "
-                "static GEMM"
-            )
         return True, None
 
     @classmethod
@@ -1093,11 +1064,6 @@ class Sm90StaticMxfp8BmmLinearKernel(Mxfp8LinearKernel):
             return False, "SM90 static MXFP8 BMM requires CUDA"
         if not current_platform.is_device_capability_family(90):
             return False, "SM90 static MXFP8 BMM requires SM90 (Hopper)"
-        if not _sm90_static_enabled():
-            return False, (
-                f"set {_SM90_STATIC_ENV}=1 to enable the native SM90 MXFP8 "
-                "static BMM"
-            )
         return True, None
 
     @classmethod

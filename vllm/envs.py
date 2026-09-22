@@ -59,14 +59,6 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
-    VLLM_SM90_FP4_INDEXER: bool = False
-    VLLM_SM90_FP4_GROUP6: bool = False
-    VLLM_SM90_FP4_GROUP6_STATS: bool = False
-    VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES: bool = False
-    VLLM_SM90_FP8_BLOCK32_STATIC: bool = False
-    VLLM_SM90_MHC_SPLIT_H: bool = False
-    VLLM_MHC_DISPATCH_STATS: bool = False
-    VLLM_MHC_DISPATCH_STATS_INTERVAL: int = 1000
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1095,56 +1087,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
-    ),
-    # Opt-in kill switch for the SM90 (Hopper) MXFP4 sparse indexer. When set,
-    # family(90) GPUs may use the Triton SM90 indexer-logits kernels with the
-    # MXFP4 ('mxfp4') indexer K cache and the compact candidate-block path.
-    # Default off: SM100 keeps the DeepGEMM/DeepSelect path and family(90)
-    # keeps the FP8 indexer cache.
-    "VLLM_SM90_FP4_INDEXER": lambda: bool(int(os.getenv("VLLM_SM90_FP4_INDEXER", "0"))),
-    # Opt-in K-reuse grouping for the SM90 MXFP4 paged indexer kernel.  DSpark
-    # drafts ``dspark_block_size`` (5) tokens, so a static target-verify step
-    # carries 1 + 5 = 6 query rows per request.  When set (and the builder
-    # admits the uniform 6-row step), the six same-request rows of one group
-    # decode the MXFP4 K tile once instead of six times; request identity and
-    # (compact mode) candidate-row equality are checked on device, and every
-    # failed guard falls back to the existing one-row-per-CTA kernel.  Default
-    # off: the default launch shape and every non-admitted step are unchanged.
-    "VLLM_SM90_FP4_GROUP6": lambda: bool(int(os.getenv("VLLM_SM90_FP4_GROUP6", "0"))),
-    # Debug-only branch observation for the group-6 K-reuse kernel: one uint8
-    # per (group, tile) CTA recording which branch it took (shared / per-row
-    # fallback / all-invisible tile skip).  Read back only by
-    # ``sm90_fp4_group6_stats()`` from tests; the model path never touches it and
-    # the store is constexpr-gated out when the flag is off.
-    "VLLM_SM90_FP4_GROUP6_STATS": lambda: bool(
-        int(os.getenv("VLLM_SM90_FP4_GROUP6_STATS", "0"))
-    ),
-    # Opt-in early exit for the SM90 FP4 indexer-logits kernels: a grid tile
-    # whose columns map to no visible position writes its ``-inf`` outputs and
-    # returns before the Q load / K decode / tl.dot.  Skipped entirely when the
-    # flag is off (the branch is a constexpr-gated no-op).  SGLang's matching
-    # opt-in is SGLANG_OPT_DSV41_INDEXER_SKIP_INVALID_TILES.
-    "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES": lambda: bool(
-        int(os.getenv("VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES", "0"))
-    ),
-    # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM (WP B). Default
-    # off: family(90) keeps the Marlin W8A16 fallback and SM100 is unchanged.
-    "VLLM_SM90_FP8_BLOCK32_STATIC": lambda: bool(
-        int(os.getenv("VLLM_SM90_FP8_BLOCK32_STATIC", "0"))
-    ),
-    # SM90 split-H mHC post TileLang kernel (WP C). Default off: the generic
-    # mhc_post_tilelang kernel is used instead.
-    "VLLM_SM90_MHC_SPLIT_H": lambda: bool(int(os.getenv("VLLM_SM90_MHC_SPLIT_H", "0"))),
-    # Host-side dispatch counters for the mHC TileLang paths. Default off: when
-    # off, the call sites only test a module-level bool. The counters never
-    # touch the device, so they are safe under CUDA graph capture.
-    "VLLM_MHC_DISPATCH_STATS": lambda: bool(
-        int(os.getenv("VLLM_MHC_DISPATCH_STATS", "0"))
-    ),
-    # Recorded dispatch calls between periodic mHC stats summaries (<= 0 logs
-    # only when a caller calls the snapshot/log API explicitly).
-    "VLLM_MHC_DISPATCH_STATS_INTERVAL": lambda: int(
-        os.getenv("VLLM_MHC_DISPATCH_STATS_INTERVAL", "1000")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

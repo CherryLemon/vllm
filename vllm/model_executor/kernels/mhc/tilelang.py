@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-
 import torch
 
-from vllm.model_executor.kernels.mhc import dispatch_stats as _mhc_stats
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -161,15 +158,9 @@ def mhc_pre_delayed_tilelang(
         next_pre_mix,
     )
     if num_tokens == 0:
-        if _mhc_stats.ENABLED:
-            _mhc_stats.record("pre_delayed", "empty", 0)
         return outputs
 
     use_deep_gemm = is_deep_gemm_supported()
-    if _mhc_stats.ENABLED:
-        _mhc_stats.record(
-            "pre_delayed", "deep_gemm" if use_deep_gemm else "tilelang", num_tokens
-        )
     n_splits = (
         compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
     )
@@ -384,8 +375,6 @@ def mhc_fused_post_pre_delayed_tilelang(
         device=residual.device,
     )
     if num_tokens == 0:
-        if _mhc_stats.ENABLED:
-            _mhc_stats.record("fused_post_pre_delayed", "empty", 0)
         return (
             torch.empty_like(residual),
             post.unsqueeze(-1),
@@ -396,12 +385,6 @@ def mhc_fused_post_pre_delayed_tilelang(
         )
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
-    if _mhc_stats.ENABLED:
-        _mhc_stats.record(
-            "fused_post_pre_delayed",
-            "fused" if fused_config is not None else "post_gemm",
-            num_tokens,
-        )
     if fused_config is not None:
         mixes, sqrsum, residual_cur = _MHC_FUSED_TILELANG_KERNEL(
             comb_res_mix,
@@ -807,25 +790,9 @@ def mhc_pre_broadcast_tilelang(
 
 
 def has_sm90_mhc_split_h() -> bool:
-    """Whether the SM90 split-H TileLang post kernel may be used.
-
-    Opt-in through ``VLLM_SM90_MHC_SPLIT_H`` and limited to SM90 (H100/H200)
-    CUDA. The flag normally lives in :mod:`vllm.envs`; the raw environment is
-    consulted as a fallback so this predicate also works before the env entry
-    is registered.
-    """
-    from vllm import envs
-
-    value = getattr(envs, "VLLM_SM90_MHC_SPLIT_H", None)
-    if value is None:
-        raw = os.environ.get("VLLM_SM90_MHC_SPLIT_H")
-        enabled = raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
-    else:
-        enabled = bool(value)
-    return (
-        enabled
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(90)
+    """Whether the CUDA device supports the Hopper split-H post kernel."""
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        90
     )
 
 
@@ -879,12 +846,6 @@ def mhc_post_tilelang(
     )
 
     supported = _mhc_post_split_h_supported(x, residual, post_layer_mix, comb_res_mix)
-    if _mhc_stats.ENABLED:
-        _mhc_stats.record(
-            "post",
-            "split_h" if supported else "base",
-            x.shape[0] if x.dim() >= 1 else 0,
-        )
     if supported:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _MHC_POST_SPLIT_H_TILELANG_KERNEL,
@@ -997,12 +958,6 @@ def mhc_fused_post_pre_tilelang(
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)
-    if _mhc_stats.ENABLED:
-        _mhc_stats.record(
-            "fused_post_pre",
-            "fused" if fused_config is not None else "post_gemm",
-            num_tokens,
-        )
 
     post_mix_cur = torch.empty(
         num_tokens,

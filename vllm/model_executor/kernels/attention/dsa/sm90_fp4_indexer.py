@@ -28,7 +28,6 @@ importing it never changes any existing (family(100) / fp8) behaviour.
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -59,96 +58,11 @@ _NUM_WARPS = 4
 _GROUP6 = 6
 _GROUP6_PGROUP = 8
 
-# Debug-only branch observation for the grouped kernel
-# (``VLLM_SM90_FP4_GROUP6_STATS=1``).  It proves *which branch ran*, which a
-# pure output-equality test cannot: a fallback group is numerically identical
-# to a shared one but re-reads the K tile per row.
-#
-# One byte per (group, tile) CTA, written by that CTA alone -- no atomics, so
-# the write is race-free and costs one store.  A slot still holding
-# ``_GROUP6_STAT_UNSET`` after the launch means that CTA did not run.
-_GROUP6_STAT_SHARED = 0
-_GROUP6_STAT_FALLBACK = 1
-_GROUP6_STAT_INVALID_TILE = 2
-_GROUP6_STAT_UNSET = 255
-# Triton @jit bodies may only close over constexpr globals; see `_PAYLOAD_BYTES`.
-_TL_STAT_SHARED = tl.constexpr(_GROUP6_STAT_SHARED)
-_TL_STAT_FALLBACK = tl.constexpr(_GROUP6_STAT_FALLBACK)
-_TL_STAT_INVALID_TILE = tl.constexpr(_GROUP6_STAT_INVALID_TILE)
-# One slab per device, grown on demand and only while the flag is on, plus the
-# number of slots the *last* launch used (slots beyond it hold stale codes).
-_group6_stats_buffers: dict[torch.device, torch.Tensor] = {}
-_group6_stats_last_ctas: dict[torch.device, int] = {}
-
-
-def _group6_stats_slab(device: torch.device, num_ctas: int) -> torch.Tensor | None:
-    """Per-device ``uint8`` branch-code slab of ``num_ctas`` slots, or ``None``.
-
-    Refilled with the unset sentinel before every launch, so a reader only sees
-    the current launch's codes even though the buffer is reused.  This is the
-    same mechanism that, before the writer->reader test's page-table width was
-    corrected, made that test's out-of-row page-table gather fatal: an extra
-    small allocation moved the garbage page ids into unmapped memory.  See
-    ``reports/review_fixes_round4.md`` for the 2x2 that pinned that down.
-    """
-    if not envs.VLLM_SM90_FP4_GROUP6_STATS:
-        return None
-    buf = _group6_stats_buffers.get(device)
-    if buf is None or buf.numel() < num_ctas:
-        buf = torch.empty(max(num_ctas, 1024), dtype=torch.uint8, device=device)
-        _group6_stats_buffers[device] = buf
-    buf[:num_ctas].fill_(_GROUP6_STAT_UNSET)
-    _group6_stats_last_ctas[device] = num_ctas
-    return buf[:num_ctas]
-
-
-def reset_group6_stats(device: torch.device | None = None) -> None:
-    """Mark every group-6 observation slot unset (debug helper)."""
-    for dev, buf in _group6_stats_buffers.items():
-        if device is None or dev == device:
-            buf.fill_(_GROUP6_STAT_UNSET)
-    for dev in list(_group6_stats_last_ctas):
-        if device is None or dev == device:
-            _group6_stats_last_ctas[dev] = 0
-
-
-def sm90_fp4_group6_stats(device: torch.device | None = None) -> dict[str, int]:
-    """Read the group-6 branch codes of the **last** grouped launch (debug).
-
-    Returns ``{"shared": n, "fallback": n, "invalid_tile": n}`` plus
-    ``"enabled"``, counted from the per-CTA slots of the most recent launch.
-    Only meaningful with ``VLLM_SM90_FP4_GROUP6_STATS=1``; with the flag off the
-    kernel writes nothing.  Never called from the model path.
-    """
-    totals = {
-        "enabled": int(bool(envs.VLLM_SM90_FP4_GROUP6_STATS)),
-        "shared": 0,
-        "fallback": 0,
-        "invalid_tile": 0,
-    }
-    for dev, buf in _group6_stats_buffers.items():
-        if device is not None and dev != device:
-            continue
-        num_ctas = _group6_stats_last_ctas.get(dev, 0)
-        if num_ctas == 0:
-            continue
-        counts = torch.bincount(buf[:num_ctas].detach().cpu(), minlength=3)
-        totals["shared"] += int(counts[_GROUP6_STAT_SHARED])
-        totals["fallback"] += int(counts[_GROUP6_STAT_FALLBACK])
-        totals["invalid_tile"] += int(counts[_GROUP6_STAT_INVALID_TILE])
-    return totals
-
 
 def has_sm90_fp4_indexer() -> bool:
-    """True on family(90) CUDA when ``VLLM_SM90_FP4_INDEXER`` is enabled.
-
-    This is the single predicate that gates the new kernels; family(100) and
-    every non-CUDA platform return False regardless of the env flag.
-    """
-    return (
-        bool(envs.VLLM_SM90_FP4_INDEXER)
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(90)
+    """Whether the CUDA device supports the Hopper FP4 indexer kernels."""
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        90
     )
 
 
@@ -202,10 +116,7 @@ def _load_q_packed(
         q_ptr + row * stride_qr + offs_h[:, None] * stride_qh + offs_i[None, :]
     )
     qexps = tl.load(
-        qs_ptr
-        + row * stride_sr
-        + offs_h[:, None] * stride_sh
-        + (offs_i // 16)[None, :]
+        qs_ptr + row * stride_sr + offs_h[:, None] * stride_sh + (offs_i // 16)[None, :]
     )
     qscale = tl.exp2(qexps.to(tl.float32) - 127.0)
     q_even = (_e2m1_decode(qpay & 0x0F) * qscale).to(tl.bfloat16)
@@ -264,7 +175,6 @@ def _sm90_fp4_paged_index_logits_kernel(
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
     WRITE_CANDIDATES: tl.constexpr,
-    SKIP_INVALID: tl.constexpr,
 ):
     row = tl.program_id(0)
     lb = tl.program_id(1)
@@ -273,60 +183,6 @@ def _sm90_fp4_paged_index_logits_kernel(
     offs_i = tl.arange(0, HALF_D)
 
     n_vis = tl.load(context_lens_ptr + row)
-    if SKIP_INVALID:
-        # A fully invisible tile used to run the masked K load, the Q load and
-        # both ``tl.dot``s only to overwrite every result with ``-inf``.  Exit
-        # before that work, writing exactly what the body would have written.
-        #
-        # The two modes need *different* "no visible column" predicates.
-        # Dense: ``offs_l`` is the logical position, so the tile start bound is
-        # sound.  Compact: ``offs_l`` is a candidate-matrix column, so
-        # visibility must be re-derived from the mapped ``logical`` position.
-        # Never compare a compact column against ``n_vis`` here; see the body's
-        # comment for the coordinate-space bug that caused.
-        if USE_CANDIDATES:
-            block_col = offs_l // CANDIDATE_BLOCK_SIZE
-            within = offs_l % CANDIDATE_BLOCK_SIZE
-            block = tl.load(
-                candidate_blocks_ptr + row * stride_cb + block_col,
-                mask=offs_l < width,
-                other=-1,
-            )
-            logical = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
-            visible = (offs_l < width) & (block >= 0) & (logical < n_vis)
-            tile_invisible = tl.sum(visible.to(tl.int32), axis=0) == 0
-        else:
-            tile_invisible = lb * BLOCK_L >= tl.minimum(n_vis, width)
-        if tile_invisible:
-            tl.store(
-                out_ptr + row * stride_out + offs_l,
-                -float("inf"),
-                mask=offs_l < width,
-            )
-            if WRITE_CANDIDATES:
-                # Reproduce this kernel's own all-``-inf`` tail, including the
-                # forced +inf on the newest visible *logical* block.
-                blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
-                block_ids = lb * blocks_per_tile + tl.arange(0, blocks_per_tile)
-                num_blocks = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-                last_block = (n_vis - 1) // CANDIDATE_BLOCK_SIZE
-                block_scores = tl.full((blocks_per_tile,), float("-inf"), tl.float32)
-                block_scores = tl.where(
-                    (n_vis > 0) & (block_ids == last_block) & (block_ids < num_blocks),
-                    float("inf"),
-                    block_scores,
-                )
-                tl.store(
-                    candidate_scores_ptr + row * stride_cs + block_ids,
-                    block_scores,
-                    mask=block_ids < num_blocks,
-                )
-                tl.store(
-                    candidate_lens_ptr + row,
-                    (n_vis + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE,
-                    mask=lb == 0,
-                )
-            return
     if USE_CANDIDATES:
         # Compact mode: ``offs_l`` indexes the candidate *matrix* column
         # (candidate_blocks.shape[1] * CANDIDATE_BLOCK_SIZE of them), not the
@@ -366,10 +222,7 @@ def _sm90_fp4_paged_index_logits_kernel(
     row_base = page * page_stride
 
     pay = tl.load(
-        cache_ptr
-        + row_base[:, None]
-        + off[:, None] * _PAYLOAD_BYTES
-        + offs_i[None, :],
+        cache_ptr + row_base[:, None] + off[:, None] * _PAYLOAD_BYTES + offs_i[None, :],
         mask=valid[:, None],
         other=0,
     )
@@ -508,10 +361,7 @@ def _sm90_fp4_group_load_keys(
     off = slot % page_size
     row_base = page * page_stride
     pay = tl.load(
-        cache_ptr
-        + row_base[:, None]
-        + off[:, None] * _PAYLOAD_BYTES
-        + offs_i[None, :],
+        cache_ptr + row_base[:, None] + off[:, None] * _PAYLOAD_BYTES + offs_i[None, :],
         mask=valid[:, None],
         other=0,
     )
@@ -615,7 +465,6 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     stride_bt,
     stride_cb,
     stride_out,
-    stats_ptr,
     H: tl.constexpr,
     HALF_D: tl.constexpr,
     BLOCK_L: tl.constexpr,
@@ -623,12 +472,9 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     PGROUP: tl.constexpr,
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
-    SKIP_INVALID: tl.constexpr,
-    COLLECT_STATS: tl.constexpr,
 ):
     first = tl.program_id(0) * GROUP
     lb = tl.program_id(1)
-    stat_slot = stats_ptr + tl.program_id(0) * tl.num_programs(1) + lb
     offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
     offs = tl.arange(0, PGROUP)
     rows = first + offs
@@ -644,44 +490,6 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     # is compile-time and must not force the runtime comparison into a Tensor.
     if not USE_CANDIDATES:  # noqa: SIM102
         if lb * BLOCK_L >= tl.minimum(max_n_vis, width):
-            if COLLECT_STATS:
-                tl.store(stat_slot, _TL_STAT_INVALID_TILE)
-            for j in tl.range(0, GROUP, loop_unroll_factor=1):
-                b = first + j
-                if b < n_rows:
-                    _sm90_fp4_group_invalid(
-                        out_ptr, b, offs_l, width, stride_out, BLOCK_L
-                    )
-            return
-
-    # Compact early exit, opt-in (``VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES``)
-    # because the "no row sees this tile" test costs one 64-wide candidate
-    # gather per row instead of the dense O(1) bound.  It mirrors the per-row
-    # compact predicate exactly: a column is visible for a row when its mapped
-    # logical position is inside that row's context length.  Without this the
-    # grouped compact path had no all-invisible skip at all, so the two opt-in
-    # optimisations could not be assumed to compose.
-    if USE_CANDIDATES and SKIP_INVALID:  # noqa: SIM102
-        col_block = offs_l // CANDIDATE_BLOCK_SIZE
-        within = offs_l % CANDIDATE_BLOCK_SIZE
-        n_blocks_row = width // CANDIDATE_BLOCK_SIZE
-        any_visible = tl.zeros([BLOCK_L], dtype=tl.int32)
-        for j in tl.range(0, GROUP, loop_unroll_factor=1):
-            b = first + j
-            if b < n_rows:
-                n_vis_b = tl.load(context_lens_ptr + b)
-                ids = tl.load(
-                    candidate_blocks_ptr + b * stride_cb + col_block,
-                    mask=(offs_l < width) & (col_block < n_blocks_row),
-                    other=-1,
-                )
-                logical = ids.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
-                any_visible = any_visible | (
-                    (offs_l < width) & (ids >= 0) & (logical < n_vis_b)
-                ).to(tl.int32)
-        if tl.sum(any_visible, 0) == 0:
-            if COLLECT_STATS:
-                tl.store(stat_slot, _TL_STAT_INVALID_TILE)
             for j in tl.range(0, GROUP, loop_unroll_factor=1):
                 b = first + j
                 if b < n_rows:
@@ -728,8 +536,6 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
                 share = share & (tl.sum((other_ids != lead).to(tl.int32), 0) == 0)
 
     if share:
-        if COLLECT_STATS:
-            tl.store(stat_slot, _TL_STAT_SHARED)
         k_low, k_high, logical, col_valid = _sm90_fp4_group_load_keys(
             cache_ptr,
             block_table_ptr,
@@ -775,8 +581,6 @@ def _sm90_fp4_grouped_paged_index_logits_kernel(
     else:
         # Mixed-request / partial / differing-candidate group: reload per row,
         # i.e. the existing one-row-per-CTA behaviour, never wrong.
-        if COLLECT_STATS:
-            tl.store(stat_slot, _TL_STAT_FALLBACK)
         for j in tl.range(0, GROUP, loop_unroll_factor=1):
             b = first + j
             if b < n_rows:
@@ -855,7 +659,6 @@ def _sm90_fp4_workspace_index_logits_kernel(
     USE_CANDIDATES: tl.constexpr,
     CANDIDATE_BLOCK_SIZE: tl.constexpr,
     WRITE_CANDIDATES: tl.constexpr,
-    SKIP_INVALID: tl.constexpr,
 ):
     row = tl.program_id(0)
     lb = tl.program_id(1)
@@ -865,52 +668,6 @@ def _sm90_fp4_workspace_index_logits_kernel(
 
     ks = tl.load(cu_ks_ptr + row)
     ke = tl.load(cu_ke_ptr + row)
-    if SKIP_INVALID:
-        # Same early exit as the paged kernel.  Dense visibility here is the
-        # absolute workspace interval ``[ks, ke)``; compact visibility is again
-        # a property of the mapped workspace row ``ks + logical`` and never of
-        # the candidate-matrix column ``offs_l``.
-        if USE_CANDIDATES:
-            block_col = offs_l // CANDIDATE_BLOCK_SIZE
-            within = offs_l % CANDIDATE_BLOCK_SIZE
-            block = tl.load(
-                candidate_blocks_ptr + row * stride_cb + block_col,
-                mask=offs_l < width,
-                other=-1,
-            )
-            logical = block.to(tl.int64) * CANDIDATE_BLOCK_SIZE + within
-            k_row = ks.to(tl.int64) + logical
-            visible = (offs_l < width) & (block >= 0) & (k_row < ke)
-            tile_invisible = tl.sum(visible.to(tl.int32), axis=0) == 0
-        else:
-            # ``ks >= ke`` is an empty interval: a row whose workspace scope has
-            # no positions at all (possible for a clamped/degenerate decode
-            # row) scores nothing, yet neither half-open bound test above fires
-            # for a tile that merely brackets the empty interval.
-            tile_invisible = (
-                (ks >= ke)
-                | (lb * BLOCK_L >= ke)
-                | ((lb + 1) * BLOCK_L <= ks)
-            )
-        if tile_invisible:
-            tl.store(
-                out_ptr + row * stride_out + offs_l,
-                -float("inf"),
-                mask=offs_l < width,
-            )
-            if WRITE_CANDIDATES:
-                # This kernel's tail has no forced +inf newest block (the
-                # candidate publisher applies that), so an all-``-inf`` tile
-                # stores plain ``-inf`` block scores.
-                blocks_per_tile: tl.constexpr = BLOCK_L // CANDIDATE_BLOCK_SIZE
-                block_ids = lb * blocks_per_tile + tl.arange(0, blocks_per_tile)
-                num_blocks = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-                tl.store(
-                    candidate_scores_ptr + row * stride_cs + block_ids,
-                    tl.full((blocks_per_tile,), float("-inf"), tl.float32),
-                    mask=block_ids < num_blocks,
-                )
-            return
     if USE_CANDIDATES:
         block_col = offs_l // CANDIDATE_BLOCK_SIZE
         within = offs_l % CANDIDATE_BLOCK_SIZE
@@ -1069,7 +826,7 @@ def sm90_fp4_paged_index_logits(
     assert block_table.shape[0] == rows and block_table.stride(-1) == 1
 
     use_candidates = candidate_blocks is not None
-    if use_candidates:
+    if candidate_blocks is not None:
         assert candidate_block_size > 0
         assert candidate_blocks.shape[0] == rows
         assert page_size % candidate_block_size == 0
@@ -1086,7 +843,7 @@ def sm90_fp4_paged_index_logits(
 
     # Group-6 K reuse.  Admission is explicit and conservative: the caller's
     # semantic hint (never inferred from ``rows``), a full group (``rows % 6``),
-    # the opt-in env flag, and no in-kernel candidate-score output (the grouped
+    # and no in-kernel candidate-score output (the grouped
     # kernel does not reduce block scores).  Request identity and, in compact
     # mode, per-tile candidate-row equality are re-checked on device.  Any
     # non-admitted step takes the existing one-row-per-CTA grid byte-for-byte.
@@ -1095,7 +852,6 @@ def sm90_fp4_paged_index_logits(
         and row_indices is not None
         and rows % _GROUP6 == 0
         and not write_candidates
-        and bool(envs.VLLM_SM90_FP4_GROUP6)
     )
 
     if rows == 0 or width == 0:
@@ -1123,7 +879,7 @@ def sm90_fp4_paged_index_logits(
     else:
         candidate_scores = logits
         candidate_lens = context_lens
-    if use_candidates:
+    if candidate_blocks is not None:
         cand = candidate_blocks.contiguous()
         stride_cb = cand.stride(0)
     else:
@@ -1142,9 +898,6 @@ def sm90_fp4_paged_index_logits(
             f"row_indices has {row_indices.shape[0]} entries for {rows} rows"
         )
         grid = (triton.cdiv(rows, _GROUP6), triton.cdiv(width, _BLOCK_L))
-        # One line per process: this is the only place the group-6 K-reuse
-        # launch shape is observable from a serving log (the per-CTA branch
-        # codes need VLLM_SM90_FP4_GROUP6_STATS and an in-process reader).
         logger.info_once(
             "SM90 FP4 indexer: grouped (group-6) kernel launched "
             "(rows=%d width=%d groups=%d tiles=%d).",
@@ -1153,7 +906,6 @@ def sm90_fp4_paged_index_logits(
             grid[0],
             grid[1],
         )
-        stats = _group6_stats_slab(logits.device, grid[0] * grid[1])
         _sm90_fp4_grouped_paged_index_logits_kernel[grid](
             q_values,
             q_scale_bytes,
@@ -1176,7 +928,6 @@ def sm90_fp4_paged_index_logits(
             block_table.stride(0),
             stride_cb,
             logits.stride(0),
-            logits if stats is None else stats,
             H=heads,
             HALF_D=INDEX_HEAD_DIM // 2,
             BLOCK_L=_BLOCK_L,
@@ -1184,8 +935,6 @@ def sm90_fp4_paged_index_logits(
             PGROUP=_GROUP6_PGROUP,
             USE_CANDIDATES=use_candidates,
             CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
-            SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
-            COLLECT_STATS=stats is not None,
             num_warps=_NUM_WARPS,
         )
         # ``use_grouped`` requires ``not write_candidates``, so the grouped
@@ -1222,7 +971,6 @@ def sm90_fp4_paged_index_logits(
         USE_CANDIDATES=use_candidates,
         CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
         WRITE_CANDIDATES=write_candidates,
-        SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
         num_warps=_NUM_WARPS,
     )
     if write_candidates:
@@ -1268,7 +1016,7 @@ def sm90_fp4_workspace_index_logits(
     total = k_values.shape[0]
 
     use_candidates = candidate_blocks is not None
-    if use_candidates:
+    if candidate_blocks is not None:
         assert candidate_block_size > 0
         assert candidate_blocks.shape[0] == rows
         assert _BLOCK_L % candidate_block_size == 0
@@ -1300,7 +1048,7 @@ def sm90_fp4_workspace_index_logits(
         )
     else:
         candidate_scores = logits
-    if use_candidates:
+    if candidate_blocks is not None:
         cand = candidate_blocks.contiguous()
         stride_cb = cand.stride(0)
     else:
@@ -1336,7 +1084,6 @@ def sm90_fp4_workspace_index_logits(
         USE_CANDIDATES=use_candidates,
         CANDIDATE_BLOCK_SIZE=candidate_block_size or 1,
         WRITE_CANDIDATES=write_candidates,
-        SKIP_INVALID=envs.VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES,
         num_warps=_NUM_WARPS,
     )
     if write_candidates:

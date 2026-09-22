@@ -310,10 +310,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         MarlinNvFp4LinearKernel,
         MarlinMxFp4LinearKernel,
     },
-    # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM. NOTE: reaching
-    # this through --linear-backend also requires adding the name to the
-    # LinearBackend Literal in vllm/config/kernel.py (owned outside WP B);
-    # the supported opt-in today is VLLM_SM90_FP8_BLOCK32_STATIC=1.
+    # Native SM90 (Hopper) MXFP8 block-32 static Triton GEMM.
     "mxfp8_sm90_static": {
         Sm90StaticMxfp8LinearKernel,
         Sm90StaticMxfp8BmmLinearKernel,
@@ -541,37 +538,20 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     ],
 }
 
+
 # in priority/performance order (when available)
 def _cuda_mxfp8_kernels() -> list[type[Mxfp8LinearKernel]]:
-    """CUDA MXFP8 kernel priority list, in priority/performance order.
-
-    ``Sm90StaticMxfp8LinearKernel`` is default-off (its ``is_supported`` also
-    requires ``VLLM_SM90_FP8_BLOCK32_STATIC=1``). With the opt-in off it is
-    appended last, so ``auto`` keeps selecting Marlin (SM90) / FlashInfer
-    (SM100) exactly as before. With the opt-in on it is inserted directly
-    above Marlin, taking precedence on SM90 while SM100 entries stay ahead.
-    """
-    kernels: list[type[Mxfp8LinearKernel]] = [
+    """Prefer native Hopper GEMM over Marlin on SM90-capable devices."""
+    return [
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
+        Sm90StaticMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
         B12xMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
         HummingMxfp8LinearKernel,
         FlashInferTrtllmMxfp8LinearKernel,
     ]
-    from vllm.model_executor.kernels.linear.mxfp8.sm90_static import (
-        _sm90_static_enabled,
-    )
-
-    if _sm90_static_enabled():
-        kernels.insert(
-            kernels.index(MarlinMxfp8LinearKernel),
-            Sm90StaticMxfp8LinearKernel,
-        )
-    else:
-        kernels.append(Sm90StaticMxfp8LinearKernel)
-    return kernels
 
 
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
@@ -977,9 +957,7 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     platform = current_platform._enum
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
-        possible = (
-            _mxfp8_bmm_candidate_kernels() if current_platform.is_cuda() else []
-        )
+        possible = _mxfp8_bmm_candidate_kernels() if current_platform.is_cuda() else []
     else:
         possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
 

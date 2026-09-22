@@ -570,6 +570,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, (block_ids,))
 
+    def has_pending_push_work(self) -> bool:
+        if self.connector_scheduler is None:
+            return False
+        return self.connector_scheduler.has_pending_push_work()
+
     def request_finished_all_groups(
         self,
         request: "Request",
@@ -915,23 +920,41 @@ class MooncakeConnectorScheduler:
 
         assert not self.is_kv_consumer
 
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        # The prefill leg is max_tokens=1. EOS is checked before the length
+        # cap, so that one token is often FINISHED_STOPPED. The prompt KV is
+        # still what the decoder asked for; dropping it makes the pull wait
+        # until abort. NIXL sends on both statuses.
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
             return False, None
 
-        # TODO: check whether block_ids actually ever be 0. If not we could
-        # remove the conditional below
-        delay_free_blocks = any(len(group) > 0 for group in block_ids)
-
-        if delay_free_blocks:
-            self._reqs_need_send[request.request_id] = (
-                request,
-                self.get_sw_clipped_blocks(block_ids),
+        clipped = self.get_sw_clipped_blocks(block_ids)
+        delay_free_blocks = any(len(group) > 0 for group in clipped)
+        if not delay_free_blocks:
+            logger.warning(
+                "Mooncake producer finished %s with no blocks to send: "
+                "status=%s computed_tokens=%s raw_groups=%s clipped_groups=%s",
+                request.request_id,
+                request.status,
+                request.num_computed_tokens,
+                [len(group) for group in block_ids],
+                [len(group) for group in clipped],
             )
+            self._reqs_not_processed.add(params["transfer_id"])
+            return False, None
 
-        return delay_free_blocks, None
+        self._reqs_need_send[request.request_id] = (request, clipped)
+        return True, None
+
+    def has_pending_push_work(self) -> bool:
+        # Blocks are published to the worker on the next schedule. If the
+        # request itself was freed, nothing else keeps the engine stepping.
+        return bool(self._reqs_need_send or self._reqs_not_processed)
 
 
 class MooncakeConnectorWorker:

@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
     MooncakeXferMetadata,
     MooncakeXferResponse,
@@ -728,6 +729,14 @@ def test_scheduler_request_finished():
     assert delay_free is True
     assert "id-1" in scheduler_connector._reqs_need_send
     assert scheduler_connector._reqs_need_send["id-1"][1] == [[10, 11]]
+    assert scheduler_connector.has_pending_push_work()
+
+    # EOS on the one-token prefill leg. Prompt KV still has to move.
+    scheduler_connector._reqs_need_send.clear()
+    request.status = RequestStatus.FINISHED_STOPPED
+    delay_free, _ = scheduler_connector.request_finished(request, block_ids=([10, 11],))
+    assert delay_free is True
+    assert scheduler_connector._reqs_need_send["id-1"][1] == [[10, 11]]
 
     # Case: Aborted (No need to transfer, free blocks immediately)
     scheduler_connector._reqs_need_send.clear()
@@ -736,6 +745,46 @@ def test_scheduler_request_finished():
     assert delay_free is False
     assert len(scheduler_connector._reqs_need_send) == 0
     assert "id-1" in scheduler_connector._reqs_not_processed
+    assert scheduler_connector.has_pending_push_work()
+
+
+@pytest.mark.parametrize(
+    "status,block_ids,expect_send",
+    [
+        (RequestStatus.FINISHED_STOPPED, ([10, 11],), True),
+        (RequestStatus.FINISHED_LENGTH_CAPPED, ([10, 11],), True),
+        (RequestStatus.FINISHED_ABORTED, ([10, 11],), False),
+        (RequestStatus.FINISHED_STOPPED, ([],), False),
+    ],
+)
+def test_producer_retains_pending_transfer_work(status, block_ids, expect_send):
+    """EOS publishes prompt KV; aborts and empty caches notify the consumer."""
+    sched = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    sched._reqs_need_send = {}
+    sched._reqs_not_processed = set()
+    sched.is_kv_consumer = False
+    sched._is_hma_required = False
+    sched.kv_cache_config = SimpleNamespace(transfer_group_ids=(0,))
+    request = SimpleNamespace(
+        request_id="id-1",
+        status=status,
+        num_computed_tokens=201,
+        kv_transfer_params={
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "transfer_id": "xfer-1",
+        },
+    )
+    delay_free, params = sched.request_finished(request, block_ids)
+    assert params is None
+    assert delay_free is expect_send
+    if expect_send:
+        assert sched._reqs_need_send["id-1"][1] == [[10, 11]]
+        assert not sched._reqs_not_processed
+    else:
+        assert not sched._reqs_need_send
+        assert "xfer-1" in sched._reqs_not_processed
+    assert sched.has_pending_push_work()
 
 
 @contextlib.contextmanager

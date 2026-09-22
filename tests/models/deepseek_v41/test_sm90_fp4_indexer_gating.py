@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gating tests for the opt-in SM90 MXFP4 sparse indexer.
+"""Gating tests for the SM90 MXFP4 sparse indexer.
 
 These are CPU tests: they exercise the predicates and the config guard, not the
 kernels.  Kernel behaviour is covered (and skipped without a GPU) by
@@ -17,21 +17,6 @@ import vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer as sm90
 import vllm.v1.attention.backends.mla.indexer as indexer_mod
 from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
 
-FLAG = "VLLM_SM90_FP4_INDEXER"
-
-
-@pytest.fixture
-def flag(monkeypatch):
-    """Set/clear the kill switch and re-read it through vllm.envs."""
-    def _set(value: str | None):
-        if value is None:
-            monkeypatch.delenv(FLAG, raising=False)
-        else:
-            monkeypatch.setenv(FLAG, value)
-        return bool(envs.VLLM_SM90_FP4_INDEXER)
-
-    return _set
-
 
 def _config(kv_dtype: str = "mxfp4"):
     return SimpleNamespace(
@@ -41,36 +26,16 @@ def _config(kv_dtype: str = "mxfp4"):
     )
 
 
-def test_flag_defaults_off(flag):
-    assert flag(None) is False
-    assert flag("0") is False
-
-
-def test_has_sm90_fp4_indexer_predicate(flag, monkeypatch):
-    # Flag off: False even on a family(90) CUDA device.
-    flag(None)
-    monkeypatch.setattr(sm90.current_platform, "is_cuda", lambda: True)
+@pytest.mark.parametrize(
+    "cuda,family,expected",
+    [(True, 90, True), (True, 100, False), (True, 120, False), (False, 90, False)],
+)
+def test_has_sm90_fp4_indexer_predicate(monkeypatch, cuda, family, expected):
+    monkeypatch.setattr(sm90.current_platform, "is_cuda", lambda: cuda)
     monkeypatch.setattr(
-        sm90.current_platform, "is_device_capability_family", lambda fam: fam == 90
+        sm90.current_platform, "is_device_capability_family", lambda fam: fam == family
     )
-    assert sm90.has_sm90_fp4_indexer() is False
-
-    # Flag on + family(90) CUDA: True.
-    flag("1")
-    assert sm90.has_sm90_fp4_indexer() is True
-
-    # family(100) stays on the existing DeepGEMM/DeepSelect path.
-    monkeypatch.setattr(
-        sm90.current_platform, "is_device_capability_family", lambda fam: fam == 100
-    )
-    assert sm90.has_sm90_fp4_indexer() is False
-
-    # Non-CUDA platforms never take the branch.
-    monkeypatch.setattr(
-        sm90.current_platform, "is_device_capability_family", lambda fam: fam == 90
-    )
-    monkeypatch.setattr(sm90.current_platform, "is_cuda", lambda: False)
-    assert sm90.has_sm90_fp4_indexer() is False
+    assert sm90.has_sm90_fp4_indexer() is expected
 
 
 def test_dsa_indexer_uses_fp4_gating(monkeypatch):
@@ -86,12 +51,8 @@ def test_dsa_indexer_uses_fp4_gating(monkeypatch):
     _platform(family=100)
     assert dsa_indexer_uses_fp4(_config()) is True
 
-    # mxfp4 on family(90) needs the flag.
+    # mxfp4 on Hopper uses the native Triton indexer.
     _platform(family=90)
-    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: False)
-    with pytest.raises(ValueError, match="VLLM_SM90_FP4_INDEXER=1"):
-        dsa_indexer_uses_fp4(_config())
-    monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: True)
     assert dsa_indexer_uses_fp4(_config()) is True
 
     # sm_120 / older architectures are still rejected.
@@ -170,6 +131,7 @@ def test_sm90_kernels_reject_ratio_two():
             ratio=2,
         )
 
+
 # ---------------------------------------------------------------------------
 # DSpark speculative-decode capability (DeepSeek-V4.1's MTP-equivalent)
 # ---------------------------------------------------------------------------
@@ -227,7 +189,7 @@ def test_sm90_fp4_capability_is_fp4_only(monkeypatch):
     # No SM90 FP4 kernel involved -> the DeepGEMM table still governs.
     assert indexer_mod._use_flattening(fp8_cfg) is False
 
-    # mxfp4 with the opt-in off is still not the SM90 FP4 path.
+    # mxfp4 on a different architecture is not the SM90 FP4 path.
     monkeypatch.setattr(indexer_mod, "dsa_indexer_uses_fp4", lambda cfg: True)
     monkeypatch.setattr(indexer_mod, "has_sm90_fp4_indexer", lambda: False)
     assert indexer_mod._sm90_fp4_indexer_active(_spec_config("mxfp4", 1)) is False
@@ -248,7 +210,7 @@ def test_dspark_block5_next_n_matches_block_size(monkeypatch):
 
 
 def test_dspark_group6_capability_gating(monkeypatch):
-    """Group-6 needs the opt-in flag, DSpark, and the block5 (next_n == 6) shape.
+    """Group-6 needs the SM90 FP4 path, DSpark, and the block5 (next_n == 6) shape.
 
     The predicate only decides whether the builder publishes the flattened
     row->request map; the kernel still re-checks request identity on device.
@@ -269,10 +231,6 @@ def test_dspark_group6_capability_gating(monkeypatch):
             num_speculative_tokens=num_speculative_tokens,
         )
 
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", False)
-    assert indexer_mod._sm90_dspark_group6_active(_cfg()) is False
-
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
     assert indexer_mod._sm90_dspark_group6_active(_cfg()) is True
     # Block size other than 5 -> next_n != 6 -> no group.
     assert indexer_mod._sm90_dspark_group6_active(_cfg(4)) is False
@@ -316,15 +274,15 @@ def test_reserve_workspaces_claims_overlap_in_lifetime(monkeypatch):
     obj.candidate_block_size = 8
 
     device = torch.device("cuda")
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    base = torch.cuda.memory_allocated()
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    torch.accelerator.reset_peak_memory_stats()
+    base = torch.accelerator.memory_allocated()
 
     obj._reserve_workspaces(device)
 
-    torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated() - base
+    torch.accelerator.synchronize()
+    peak = torch.accelerator.max_memory_allocated() - base
 
     logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
     scratch_bytes = (

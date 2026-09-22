@@ -54,7 +54,7 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 # The DSA indexer K cache is always quantized; "auto" means fp8 (V3.2 layout)
-# and mxfp4 is the opt-in Blackwell path.
+# and mxfp4 is supported on Hopper and datacenter Blackwell.
 DSA_INDEXER_KV_DTYPES = ("fp8", "mxfp4")
 
 
@@ -73,8 +73,8 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
     ):
         raise ValueError(
             "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
-            "(sm_10x, e.g. B200/GB200), or family(90) (H100/H200) with "
-            "VLLM_SM90_FP4_INDEXER=1; sm_120 (consumer Blackwell) and earlier "
+            "(sm_10x, e.g. B200/GB200), or Hopper (H100/H200); "
+            "sm_120 (consumer Blackwell) and earlier "
             "architectures are not supported."
         )
     return use_fp4
@@ -861,7 +861,6 @@ def _sm90_dspark_group6_active(vllm_config: VllmConfig) -> bool:
     spec = vllm_config.speculative_config
     return (
         _sm90_fp4_indexer_active(vllm_config)
-        and bool(envs.VLLM_SM90_FP4_GROUP6)
         and spec is not None
         and spec.use_dspark()
         and spec.num_speculative_tokens == 5  # 1 + 5 = 6 verification rows
@@ -951,12 +950,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
-            "(next_n=%d, use_fp4_cache=%s, sm90_fp4_indexer=%s)",
+            "(next_n=%d, use_fp4_cache=%s, sm90_fp4_indexer=%s, sm90_group6=%s)",
             self.use_flattening,
             self.supports_varlen,
             next_n,
             self.indexer_uses_fp4,
             self.sm90_fp4_indexer,
+            self.sm90_group6,
         )
 
         sm_count = num_compute_units(self.device.index)

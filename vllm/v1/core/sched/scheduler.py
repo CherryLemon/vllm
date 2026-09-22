@@ -3125,9 +3125,19 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+            elif RequestStatus.is_finished(req.status):
+                # The request finished before the transfer did. Its blocks
+                # were kept only so the connector could complete.
+                self._free_blocks(req)
             else:
-                assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                # A second completion from another worker, or a notify-only
+                # recv for a request that was never parked. Freeing its blocks
+                # would drop a live request; killing the engine is worse.
+                logger.warning(
+                    "Ignoring KV recv completion for request %s in status %s",
+                    req_id,
+                    req.status,
+                )
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests

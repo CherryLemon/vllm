@@ -2,19 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kernel-level performance probe for the SM90 group-6 K-reuse path.
 
-The serving-level A/B (`VLLM_SM90_FP4_GROUP6=0` vs `1` on the decode instance)
-is too noisy to resolve a kernel-level win: on two nodes with a shared NVMe,
-run-to-run throughput varied 15-25 % at 64 prompts and concurrency 8.  This
-probe measures the effect where it is defined -- one launch of the grouped
-kernel versus the same work as six per-row launches -- with warmup, repeats and
-an assertion that the timed grouped launch actually took the *shared* branch
-(the per-CTA branch codes, so "it was faster" cannot come from a fallback that
-merely reloads K per row).
+Compare the grouped and per-row kernels on identical inputs after warmup.
+Requires family(90) CUDA.
 
-    python3 tests/kernels/attention/dsv41_group6_perf_probe.py --repeats 50
-
-Requires the same environment as the kernel tests: family(90) CUDA with
-``VLLM_SM90_FP4_INDEXER=1`` and ``VLLM_SM90_FP4_GROUP6=1``.
+    .venv/bin/python benchmarks/kernels/attention/dsv41_group6_perf_probe.py
 """
 
 import argparse
@@ -36,8 +27,6 @@ sys.path.insert(
     ),
 )
 
-import vllm.envs as envs
-import vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer as sm90_mod
 from tests.kernels.attention.test_sm90_fp4_indexer import (
     PAGE_SIZE,
     _packed_cache,
@@ -52,10 +41,8 @@ from vllm.platforms import current_platform
 
 def _available() -> bool:
     """family(90) CUDA with the SM90 FP4 indexer enabled."""
-    return (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability_family(90)
-        and bool(envs.VLLM_SM90_FP4_INDEXER)
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        90
     )
 
 
@@ -68,7 +55,7 @@ def _time_launch(fn, repeats: int) -> float:
         start.record()
         fn()
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         samples.append(start.elapsed_time(end) * 1000.0)
     return statistics.median(samples)
 
@@ -126,17 +113,12 @@ def main() -> int:
 
     if not _available():
         print(
-            "SKIP: needs family(90) CUDA with VLLM_SM90_FP4_INDEXER=1",
+            "SKIP: needs family(90) CUDA",
             file=sys.stderr,
         )
         return 2
 
     device = "cuda"
-    envs_ok = bool(envs.VLLM_SM90_FP4_GROUP6)
-    print(
-        f"VLLM_SM90_FP4_GROUP6={int(envs_ok)} "
-        f"VLLM_SM90_FP4_GROUP6_STATS={int(envs.VLLM_SM90_FP4_GROUP6_STATS)}"
-    )
     results = []
     # The live DSpark capture shapes (group-6 is admitted when every request
     # owns exactly six flattened verify rows).
@@ -155,12 +137,9 @@ def main() -> int:
         for _ in range(args.warmup):
             per_row()
             grouped()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
-        sm90_mod.reset_group6_stats()
-        grouped()
-        torch.cuda.synchronize()
-        stats = sm90_mod.sm90_fp4_group6_stats()
+        torch.testing.assert_close(grouped(), per_row(), rtol=0, atol=0)
 
         t_row = _time_launch(per_row, args.repeats)
         t_grp = _time_launch(grouped, args.repeats)
@@ -171,21 +150,13 @@ def main() -> int:
             "per_row_us": t_row,
             "grouped_us": t_grp,
             "speedup": t_row / t_grp if t_grp else float("nan"),
-            "shared_ctas": stats["shared"],
-            "fallback_ctas": stats["fallback"],
-            "invalid_tile_ctas": stats["invalid_tile"],
         }
         results.append(entry)
         print(
             f"requests={requests:<3d} rows={rows:<4d} width={width:<6d} "
             f"per_row={t_row:8.1f}us grouped={t_grp:8.1f}us "
-            f"speedup={entry['speedup']:5.2f}x shared={stats['shared']} "
-            f"fallback={stats['fallback']} skipped={stats['invalid_tile']}"
+            f"speedup={entry['speedup']:5.2f}x"
         )
-        if stats["shared"] == 0:
-            print("  WARNING: no shared CTA -- the timing is not a reuse win")
-        if stats["fallback"] != 0:
-            print("  WARNING: fallback CTAs present -- reuse was partial")
 
     if args.out:
         with open(args.out, "w") as fh:

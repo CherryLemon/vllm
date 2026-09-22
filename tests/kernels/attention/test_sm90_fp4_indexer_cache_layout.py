@@ -94,9 +94,7 @@ def _gptj_rope(
     # The kernel gathers with a pair-wide index and masks the non-RoPE lanes,
     # so build the same padded pair-wide source and mask it the same way.
     num_pairs = HEAD_DIM // 2
-    cos_src = torch.zeros(
-        cs.shape[0], num_pairs, device=cs.device, dtype=cs.dtype
-    )
+    cos_src = torch.zeros(cs.shape[0], num_pairs, device=cs.device, dtype=cs.dtype)
     sin_src = torch.zeros_like(cos_src)
     cos_src[:, :HALF_ROPE] = cs[:, :HALF_ROPE]
     sin_src[:, :HALF_ROPE] = cs[:, HALF_ROPE:]
@@ -182,12 +180,12 @@ def _reader_layout_dequant(
 
     pay = at(offs[:, None] * PAYLOAD_BYTES + i[None, :])
     exps = at(
-        page_size * PAYLOAD_BYTES
-        + offs[:, None] * SCALE_BYTES
-        + (i[None, :] // 16)
+        page_size * PAYLOAD_BYTES + offs[:, None] * SCALE_BYTES + (i[None, :] // 16)
     )
     scale = torch.exp2(exps.to(torch.float32) - 127.0)
-    out = torch.empty((slots.numel(), HEAD_DIM), dtype=torch.float32, device=cache.device)
+    out = torch.empty(
+        (slots.numel(), HEAD_DIM), dtype=torch.float32, device=cache.device
+    )
     out[:, 0::2] = _decode_e2m1(pay & 0x0F) * scale
     out[:, 1::2] = _decode_e2m1((pay >> 4) & 0x0F) * scale
     return out
@@ -255,7 +253,6 @@ def test_writer_bytes_match_the_readers_layout(
     """
     from vllm.models.deepseek_v41.common.ops import indexer_k_norm_rope_store
 
-    monkeypatch.setenv("VLLM_SM90_FP4_INDEXER", "1")
     device = "cuda"
     torch.manual_seed(0)
     num_blocks = 8
@@ -289,12 +286,10 @@ def test_writer_bytes_match_the_readers_layout(
         compress_ratio,
         use_fp4_cache=True,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # The intended K, in torch, following the writer's maths exactly.
-    k = _gptj_rope(
-        _rms_norm(k_pre, weight, eps), positions, cos_sin, compress_ratio
-    )
+    k = _gptj_rope(_rms_norm(k_pre, weight, eps), positions, cos_sin, compress_ratio)
     boundary = torch.tensor(
         [(g + 1) * compress_ratio - 1 for g in range(n_groups)], device=device
     )
@@ -309,15 +304,11 @@ def test_writer_bytes_match_the_readers_layout(
 
     # (1) Bit-exact against the reference round-trip: this is the layout pin.
     packed, ue8m0 = _mxfp4_quantize_reference(k_expected)
-    torch.testing.assert_close(
-        got, _decode_packed(packed, ue8m0), rtol=0, atol=0
-    )
+    torch.testing.assert_close(got, _decode_packed(packed, ue8m0), rtol=0, atol=0)
 
     # (2) And the decoded values are a faithful MXFP4 encoding of the intended
     # K, which catches a reference that is self-consistently wrong.
-    torch.testing.assert_close(
-        got, k_expected.to(torch.float32), rtol=0.2, atol=0.7
-    )
+    torch.testing.assert_close(got, k_expected.to(torch.float32), rtol=0.2, atol=0.7)
 
     # (3) Slots that were never written must stay zero.
     unwritten = [p * PAGE_SIZE + o for p in range(num_blocks) for o in range(2)]
@@ -344,17 +335,15 @@ def test_reader_consumes_writer_produced_cache(monkeypatch):
     the reference quantiser), never from the cache, so the two sides are
     genuinely independent.
     """
+    from tests.kernels.attention.test_sm90_fp4_indexer import (
+        _rand_q,
+        _valid_q_scale,
+    )
     from vllm.model_executor.kernels.attention.dsa.sm90_fp4_indexer import (
         sm90_fp4_paged_index_logits,
     )
     from vllm.models.deepseek_v41.common.ops import indexer_k_norm_rope_store
 
-    from tests.kernels.attention.test_sm90_fp4_indexer import (
-        _rand_q,
-        _valid_q_scale,
-    )
-
-    monkeypatch.setenv("VLLM_SM90_FP4_INDEXER", "1")
     device = "cuda"
     torch.manual_seed(7)
     rows, heads = 2, 32
@@ -367,10 +356,7 @@ def test_reader_consumes_writer_produced_cache(monkeypatch):
     # overwrite each other's KV, which is a test bug, not a layout bug.
     perm = torch.tensor([4, 0, 6, 2, 7, 1, 5, 3], device=device, dtype=torch.int64)
     block_table = torch.stack(
-        [
-            perm[r * compress_ratio : (r + 1) * compress_ratio]
-            for r in range(rows)
-        ]
+        [perm[r * compress_ratio : (r + 1) * compress_ratio] for r in range(rows)]
     )
     assert block_table.shape == (rows, compress_ratio)
     assert block_table.unique().numel() == rows * compress_ratio
@@ -396,7 +382,7 @@ def test_reader_consumes_writer_produced_cache(monkeypatch):
         compress_ratio,
         use_fp4_cache=True,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     q_values = _rand_q(rows, heads, device)
     q_scale = _valid_q_scale(rows, heads, device)

@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm.envs as envs
 import vllm.v1.attention.backends.mla.indexer as indexer_mod
 from tests.v1.attention.utils import create_vllm_config
 from vllm.utils.deep_gemm import has_deep_gemm
@@ -96,9 +95,7 @@ def _block6_common(num_requests: int = 2, decode_len: int = 6):
     query_start_loc[1:] = torch.tensor(
         query_lens, dtype=torch.int32, device=device
     ).cumsum(0)
-    seq_lens = torch.full(
-        (num_requests,), 512, dtype=torch.int32, device=device
-    )
+    seq_lens = torch.full((num_requests,), 512, dtype=torch.int32, device=device)
     block_table_tensor = torch.arange(
         num_requests * 16, dtype=torch.int32, device=device
     ).reshape(num_requests, 16)
@@ -124,9 +121,7 @@ def _dense_group6_case(num_requests: int = 2, decode_len: int = 6):
     kv_cache_spec = _kv_cache_spec()
     vllm_config = _sm90_group6_config()
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
-    block_table_width = get_block_table_width(
-        max_num_blocks, kv_cache_spec.block_size
-    )
+    block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy"],
@@ -139,9 +134,6 @@ def _dense_group6_case(num_requests: int = 2, decode_len: int = 6):
 
 def test_group6_builder_keeps_deepgemm_indices_empty(monkeypatch):
     """The dense/source builder must publish the map, but never to DeepGEMM."""
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_INDEXER", True)
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
-
     builder, common = _dense_group6_case()
     assert builder.sm90_group6 is True, "fixture must admit the group-6 path"
     assert builder.supports_varlen is False, "the SM90 dense builder is non-varlen"
@@ -206,11 +198,7 @@ def test_group6_builder_leaves_varlen_map_on_the_deepgemm_field(monkeypatch):
     simply dropped ``decode_indices`` everywhere, the SM100 varlen path would
     silently lose its DeepGEMM schedule input.
     """
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_INDEXER", True)
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
-    monkeypatch.setattr(
-        indexer_mod, "_supports_varlen_paged_mqa_logits", lambda: True
-    )
+    monkeypatch.setattr(indexer_mod, "_supports_varlen_paged_mqa_logits", lambda: True)
     monkeypatch.setattr(indexer_mod, "_use_flattening", lambda cfg: True)
 
     builder, common = _dense_group6_case()
@@ -235,6 +223,7 @@ def test_group6_builder_leaves_varlen_map_on_the_deepgemm_field(monkeypatch):
         assert len(calls) == 1
         assert calls[0]["kwargs"].get("indices") is not None, calls
 
+
 def test_compact_builder_admits_group6_on_a_block5_step(monkeypatch):
     """The compact (varlen) builder must also get ``spec_group_size == 6``.
 
@@ -250,16 +239,11 @@ def test_compact_builder_admits_group6_on_a_block5_step(monkeypatch):
         DeepseekV41SparseIndexerMetadataBuilder,
     )
 
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_INDEXER", True)
-    monkeypatch.setattr(envs, "VLLM_SM90_FP4_GROUP6", True)
-
     device = torch.device("cuda")
     kv_cache_spec = _kv_cache_spec()
     vllm_config = _sm90_compact_group6_config()
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
-    block_table_width = get_block_table_width(
-        max_num_blocks, kv_cache_spec.block_size
-    )
+    block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV41SparseIndexerMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy"],

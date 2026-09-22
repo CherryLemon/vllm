@@ -21,14 +21,14 @@ without also wiring the rest of the o-projection contract.
 
 import pytest
 
-from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
-    Mxfp8LinearLayerConfig,
-)
 from vllm.model_executor.kernels.linear.mxfp8.deep_gemm import (
     DeepGemmMxfp8BmmLinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.emulation import (
     EmulationMxfp8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+    Mxfp8LinearLayerConfig,
 )
 from vllm.model_executor.kernels.linear.mxfp8.sm90_static import (
     Sm90StaticMxfp8BmmLinearKernel,
@@ -39,8 +39,6 @@ from vllm.platforms import current_platform
 # DeepSeek-V4.1 ``config.o_groups`` (the HF config default; the deployed JSON is
 # authoritative). ``wo_a.bmm_batch_size = n_local_groups = o_groups // tp_size``.
 DSV41_O_GROUPS = 8
-
-_STATIC_FLAG = "VLLM_SM90_FP8_BLOCK32_STATIC"
 
 
 def _simulate_sm90(monkeypatch) -> None:
@@ -90,41 +88,27 @@ def test_sm90_static_bmm_exclusion_is_policy_not_inability():
     # the plain static kernel that refuses bmm. The absence from the candidate
     # list is therefore a deliberate contract decision, not a can_implement()
     # accident that a future change might "fix" by making it selectable.
-    assert Sm90StaticMxfp8BmmLinearKernel.can_implement(
-        Mxfp8LinearLayerConfig(bmm_batch_size=1)
-    )[0] is True
-    assert Sm90StaticMxfp8LinearKernel.can_implement(
-        Mxfp8LinearLayerConfig(bmm_batch_size=1)
-    )[0] is False
+    assert (
+        Sm90StaticMxfp8BmmLinearKernel.can_implement(
+            Mxfp8LinearLayerConfig(bmm_batch_size=1)
+        )[0]
+        is True
+    )
+    assert (
+        Sm90StaticMxfp8LinearKernel.can_implement(
+            Mxfp8LinearLayerConfig(bmm_batch_size=1)
+        )[0]
+        is False
+    )
 
 
-@pytest.mark.parametrize("flag", [None, "0", "1"])
-def test_sm90_bmm_selection_is_emulation_with_or_without_the_static_flag(
-    monkeypatch, flag: str | None
-):
-    """Regression: on SM90 the ``wo_a`` BMM slot must resolve to Emulation.
-
-    The static opt-in flag only gates the *non-BMM* SM90 static GEMM; it must
-    not change the ``wo_a`` BMM decision. If a future change registers
-    ``Sm90StaticMxfp8BmmLinearKernel`` here without wiring
-    ``deep_gemm_fp8_o_proj`` to dispatch to it, this test fails.
-    """
+def test_sm90_bmm_selection_is_emulation(monkeypatch):
+    """The wo_a BMM slot requires emulation until o-projection supports MXFP8."""
     from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 
     _simulate_sm90(monkeypatch)
     _refuse_deep_gemm_bmm(monkeypatch)
-
-    if flag is None:
-        monkeypatch.delenv(_STATIC_FLAG, raising=False)
-    else:
-        monkeypatch.setenv(_STATIC_FLAG, flag)
-
-    # Sanity: with the flag on, the *plain* static kernel is supported on this
-    # simulated SM90, proving the flag reaches selection (and that the BMM
-    # decision is not just "everything static is disabled").
-    if flag == "1":
-        assert Sm90StaticMxfp8LinearKernel.is_supported()[0] is True
-
+    assert Sm90StaticMxfp8LinearKernel.is_supported()[0] is True
     kernel = init_mxfp8_linear_kernel(bmm_batch_size=1)
     assert type(kernel) is EmulationMxfp8LinearKernel
     assert kernel.supports_pre_processed_weights is True

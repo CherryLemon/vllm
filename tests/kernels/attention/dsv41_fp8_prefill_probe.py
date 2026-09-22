@@ -112,8 +112,7 @@ Usage
     # pure-CPU self-test of the torch reference maths (tiny shapes):
     python3 tests/kernels/attention/dsv41_fp8_prefill_probe.py --cpu-selftest
 
-    # the real measurement, on an idle H100 (VLLM_SM90_FP4_INDEXER unset is ok;
-    # the kernels are called directly):
+    # the real measurement, on an idle H100:
     python3 tests/kernels/attention/dsv41_fp8_prefill_probe.py \
         --lengths 8192 32768 131072 600000 --rows 16 64 512 \
         --seeds 0 1 2 --out /tmp/fp8.json
@@ -165,58 +164,116 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--lengths", type=int, nargs="+", default=_default_lengths(),
-                   help="compressed workspace lengths T (gathered rows).")
-    p.add_argument("--rows", type=int, nargs="+", default=_default_rows(),
-                   help="new query-token rows per chunk.")
-    p.add_argument("--seeds", type=int, nargs="+", default=[0],
-                   help="RNG seeds; E2/E3 are repeated per seed.")
-    p.add_argument("--out", type=str, default=None,
-                   help="write the JSON summary here (also printed to stdout).")
+    p.add_argument(
+        "--lengths",
+        type=int,
+        nargs="+",
+        default=_default_lengths(),
+        help="compressed workspace lengths T (gathered rows).",
+    )
+    p.add_argument(
+        "--rows",
+        type=int,
+        nargs="+",
+        default=_default_rows(),
+        help="new query-token rows per chunk.",
+    )
+    p.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="RNG seeds; E2/E3 are repeated per seed.",
+    )
+    p.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="write the JSON summary here (also printed to stdout).",
+    )
     p.add_argument("--device", type=str, default="cuda:0")
-    p.add_argument("--repo-root", type=str, default=None,
-                   help="vLLM checkout root; defaults to three levels above this file.")
-    p.add_argument("--dry-run", action="store_true",
-                   help="parse args, print shapes/plan and a JSON skeleton; no torch.")
-    p.add_argument("--cpu-selftest", action="store_true",
-                   help="run the pure-torch E2/E3 maths on CPU with tiny shapes.")
+    p.add_argument(
+        "--repo-root",
+        type=str,
+        default=None,
+        help="vLLM checkout root; defaults to three levels above this file.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="parse args, print shapes/plan and a JSON skeleton; no torch.",
+    )
+    p.add_argument(
+        "--cpu-selftest",
+        action="store_true",
+        help="run the pure-torch E2/E3 maths on CPU with tiny shapes.",
+    )
     p.add_argument("--skip-e1", action="store_true")
     p.add_argument("--skip-e2", action="store_true")
     p.add_argument("--skip-e3", action="store_true")
-    p.add_argument("--no-dense", action="store_true",
-                   help="skip the dense-mode E1 probe.")
+    p.add_argument(
+        "--no-dense", action="store_true", help="skip the dense-mode E1 probe."
+    )
     # geometry / model constants
     p.add_argument("--heads", type=int, default=32, help="index_n_heads.")
     p.add_argument("--head-dim", type=int, default=HEAD_DIM)
-    p.add_argument("--page-size", type=int, default=64,
-                   help="indexer cache tokens per page (attention block size).")
+    p.add_argument(
+        "--page-size",
+        type=int,
+        default=64,
+        help="indexer cache tokens per page (attention block size).",
+    )
     p.add_argument("--candidate-topk-blocks", type=int, default=2048)
     p.add_argument("--candidate-block-size", type=int, default=8)
     p.add_argument("--index-topk", type=int, default=512)
-    p.add_argument("--max-logits-mb", type=int, default=512,
-                   help="VLLM_SPARSE_INDEXER_MAX_LOGITS_MB.")
-    p.add_argument("--max-prefill-buffer-size", type=int, default=1 << 20,
-                   help="N constraint of the chunker (max_total_seq_len).")
-    p.add_argument("--compress-ratio", type=int, default=1,
-                   help="indexer group ratio, used ONLY to report the raw-token "
-                        "equivalent of T. --lengths are the compressed workspace "
-                        "length T itself; set this to the target layer's ratio "
-                        "(1 or 2 for V4.1) if you want the raw-equivalent field.")
+    p.add_argument(
+        "--max-logits-mb",
+        type=int,
+        default=512,
+        help="VLLM_SPARSE_INDEXER_MAX_LOGITS_MB.",
+    )
+    p.add_argument(
+        "--max-prefill-buffer-size",
+        type=int,
+        default=1 << 20,
+        help="N constraint of the chunker (max_total_seq_len).",
+    )
+    p.add_argument(
+        "--compress-ratio",
+        type=int,
+        default=1,
+        help="indexer group ratio, used ONLY to report the raw-token "
+        "equivalent of T. --lengths are the compressed workspace "
+        "length T itself; set this to the target layer's ratio "
+        "(1 or 2 for V4.1) if you want the raw-equivalent field.",
+    )
     # benchmark knobs
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--repeat", type=int, default=30)
     # synthetic data
-    p.add_argument("--k-std", type=float, default=1.0,
-                   help="std of the synthetic pre-quant K vectors.")
+    p.add_argument(
+        "--k-std",
+        type=float,
+        default=1.0,
+        help="std of the synthetic pre-quant K vectors.",
+    )
     p.add_argument("--q-std", type=float, default=1.0)
-    p.add_argument("--wide-factor", type=float, default=512.0,
-                   help="amplify every 8th K row / Q head-block by this before "
-                        "the deliberate-wide-scale E2/E3 runs.")
+    p.add_argument(
+        "--wide-factor",
+        type=float,
+        default=512.0,
+        help="amplify every 8th K row / Q head-block by this before "
+        "the deliberate-wide-scale E2/E3 runs.",
+    )
     p.add_argument("--wide-stride", type=int, default=8)
-    p.add_argument("--workspace-pt", type=str, default=None,
-                   help="optional real workspace dump (.pt). Keys: k_values, "
-                        "k_scales and optionally q_values, q_scale, weights. "
-                        "A dict keyed by 'T' is accepted.")
+    p.add_argument(
+        "--workspace-pt",
+        type=str,
+        default=None,
+        help="optional real workspace dump (.pt). Keys: k_values, "
+        "k_scales and optionally q_values, q_scale, weights. "
+        "A dict keyed by 'T' is accepted.",
+    )
     # E3 sizing
     p.add_argument("--e3-max-t", type=int, default=65536)
     p.add_argument("--e3-max-rows", type=int, default=64)
@@ -252,7 +309,7 @@ def chunk_plan(args, T: int, rows: int) -> dict:
     n_budget = max(T, ms)  # _prefill_split_seq_lens clamps seq_lens to ms
     rows_per_chunk = max(1, max_logits_elems // max(1, n_budget))
     n_chunks = (rows + rows_per_chunk - 1) // rows_per_chunk
-    n_ok = T <= args.max_prefill_buffer_size
+    n_ok = args.max_prefill_buffer_size >= T
     return {
         "min_split_seq_len": ms,
         "n_budget": n_budget,
@@ -388,8 +445,12 @@ def synth_k_workspace(torch, T, *, seed, k_std, wide, wide_factor, wide_stride, 
         x = xb.reshape(T, HEAD_DIM)
     x = x.to(torch.bfloat16).to(device)
     vals, scales = mxfp4_quantize(torch, x)
-    return SyntheticBundle(k_values=vals.contiguous(), k_scales=scales.contiguous(),
-                           T=T, tag="wide" if wide else "realistic")
+    return SyntheticBundle(
+        k_values=vals.contiguous(),
+        k_scales=scales.contiguous(),
+        T=T,
+        tag="wide" if wide else "realistic",
+    )
 
 
 def synth_q(torch, rows, heads, *, seed, q_std, wide, wide_factor, wide_stride, device):
@@ -438,7 +499,7 @@ def make_row_bounds(torch, rows, T, device):
 def _event_bench(torch, fn, warmup, repeat):
     for _ in range(max(0, warmup)):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     times = []
     for _ in range(max(1, repeat)):
         start = torch.cuda.Event(enable_timing=True)
@@ -446,7 +507,7 @@ def _event_bench(torch, fn, warmup, repeat):
         start.record()
         fn()
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         times.append(float(start.elapsed_time(end)))
     times.sort()
     n = len(times)
@@ -466,8 +527,9 @@ def _empty_logits(torch, rows, width, device):
     return torch.empty((rows, width), dtype=torch.float32, device=device)
 
 
-def _compact_topk(torch, logits, candidate_blocks, cbs, row_ks, row_ke, k, out,
-                  chunk_rows=64):
+def _compact_topk(
+    torch, logits, candidate_blocks, cbs, row_ks, row_ke, k, out, chunk_rows=64
+):
     """Faithful replica of ``SparseMQAIndexer._prefill_candidate_topk``."""
     rows, width = logits.shape
     out.fill_(-1)
@@ -506,20 +568,34 @@ def run_e1_gpu(torch, repo, args, results):
         for rows in args.rows:
             if (seed, rows) not in q_cache:
                 q_values, q_scale, _ = synth_q(
-                    torch, rows, args.heads, seed=seed, q_std=args.q_std,
-                    wide=False, wide_factor=args.wide_factor,
-                    wide_stride=args.wide_stride, device=device,
+                    torch,
+                    rows,
+                    args.heads,
+                    seed=seed,
+                    q_std=args.q_std,
+                    wide=False,
+                    wide_factor=args.wide_factor,
+                    wide_stride=args.wide_stride,
+                    device=device,
                 )
                 weights = torch.randn(
-                    rows, args.heads, dtype=torch.bfloat16,
+                    rows,
+                    args.heads,
+                    dtype=torch.bfloat16,
                     generator=torch.Generator().manual_seed(seed + 7),
                 ).to(device)
                 q_cache[(seed, rows)] = (q_values, q_scale, weights)
         for T in args.lengths:
             if not args.no_dense and T not in k_bundle_cache:
                 k_bundle_cache[T] = synth_k_workspace(
-                    torch, T, seed=seed, k_std=args.k_std, wide=False,
-                    wide_factor=1.0, wide_stride=args.wide_stride, device=device,
+                    torch,
+                    T,
+                    seed=seed,
+                    k_std=args.k_std,
+                    wide=False,
+                    wide_factor=1.0,
+                    wide_stride=args.wide_stride,
+                    device=device,
                 )
 
     for seed in args.seeds:
@@ -527,7 +603,9 @@ def run_e1_gpu(torch, repo, args, results):
             for rows in args.rows:
                 q_values, q_scale, weights = q_cache[(seed, rows)]
                 entry = {
-                    "seed": seed, "T": T, "rows": rows,
+                    "seed": seed,
+                    "T": T,
+                    "rows": rows,
                     "requested_rows": rows,
                     "raw_tokens_equivalent": T * args.compress_ratio,
                     "chunker": chunk_plan(args, T, rows),
@@ -535,26 +613,47 @@ def run_e1_gpu(torch, repo, args, results):
                 }
                 try:
                     entry.update(
-                        _e1_one_compact(torch, repo, args, device, T, rows,
-                                        q_values, q_scale, weights, width, cbs)
+                        _e1_one_compact(
+                            torch,
+                            repo,
+                            args,
+                            device,
+                            T,
+                            rows,
+                            q_values,
+                            q_scale,
+                            weights,
+                            width,
+                            cbs,
+                        )
                     )
                 except Exception as exc:  # noqa: BLE001
                     entry["error"] = f"{type(exc).__name__}: {exc}"
                 if not args.no_dense:
                     try:
                         entry.update(
-                            _e1_one_dense(torch, repo, args, device, T, rows,
-                                          q_values, q_scale, weights,
-                                          max_logits_elems,
-                                          k_bundle_cache[T])
+                            _e1_one_dense(
+                                torch,
+                                repo,
+                                args,
+                                device,
+                                T,
+                                rows,
+                                q_values,
+                                q_scale,
+                                weights,
+                                max_logits_elems,
+                                k_bundle_cache[T],
+                            )
                         )
                     except Exception as exc:  # noqa: BLE001
                         entry["dense_error"] = f"{type(exc).__name__}: {exc}"
                 results["e1"].append(entry)
 
 
-def _e1_one_compact(torch, repo, args, device, T, rows, q_values, q_scale, weights,
-                    width, cbs):
+def _e1_one_compact(
+    torch, repo, args, device, T, rows, q_values, q_scale, weights, width, cbs
+):
     # --- K gather workspace (exactly _gather_workspace_shapes, MXFP4) ---
     (vshape, vdtype), (sshape, sdtype) = repo.gather_workspace_shapes(
         T, args.head_dim, torch.float8_e4m3fn, use_fp4_cache=True
@@ -587,13 +686,21 @@ def _e1_one_compact(torch, repo, args, device, T, rows, q_values, q_scale, weigh
 
     def logits_fn():
         return repo.prefill_chunk(
-            q_values, q_scale, k_quant, k_scale, weights, ks, ke,
-            candidate_blocks, cbs,
+            q_values,
+            q_scale,
+            k_quant,
+            k_scale,
+            weights,
+            ks,
+            ke,
+            candidate_blocks,
+            cbs,
         )
 
     logits_ms = _event_bench(torch, logits_fn, args.warmup, args.repeat)
-    out = torch.full((rows, min(args.index_topk, width)), -1,
-                     dtype=torch.int32, device=device)
+    out = torch.full(
+        (rows, min(args.index_topk, width)), -1, dtype=torch.int32, device=device
+    )
 
     def topk_fn():
         repo.prefill_topk(logits_fn(), candidate_blocks, cbs, ks, ke, out)
@@ -609,7 +716,8 @@ def _e1_one_compact(torch, repo, args, device, T, rows, q_values, q_scale, weigh
 
     total = _event_bench(torch, full_fn, args.warmup, args.repeat)
     combined = {
-        k: total[k] - gather_ms[k] if k != "all_ms"
+        k: total[k] - gather_ms[k]
+        if k != "all_ms"
         else [t - g for t, g in zip(total["all_ms"], gather_ms["all_ms"])]
         for k in total
     }
@@ -622,13 +730,15 @@ def _e1_one_compact(torch, repo, args, device, T, rows, q_values, q_scale, weigh
             "total_ms": total,
             "logits_fraction_of_total": (
                 logits_ms["median_ms"] / total["median_ms"]
-                if total["median_ms"] else None
+                if total["median_ms"]
+                else None
             ),
             "derived": {
                 "t_over_rows": T / rows if rows else None,
                 "gather_over_logits": (
                     gather_ms["median_ms"] / logits_ms["median_ms"]
-                    if logits_ms["median_ms"] else None
+                    if logits_ms["median_ms"]
+                    else None
                 ),
                 # Extra O(T) cost an FP8 pre-decode would add, as a fraction of
                 # the per-row logits it would replace: the pre-decode touches
@@ -642,8 +752,19 @@ def _e1_one_compact(torch, repo, args, device, T, rows, q_values, q_scale, weigh
     }
 
 
-def _e1_one_dense(torch, repo, args, device, T, rows, q_values, q_scale, weights,
-                  max_logits_elems, bundle):
+def _e1_one_dense(
+    torch,
+    repo,
+    args,
+    device,
+    T,
+    rows,
+    q_values,
+    q_scale,
+    weights,
+    max_logits_elems,
+    bundle,
+):
     # The dense kernel's output is [rows, T] fp32.  The chunker would split the
     # requested rows down to the budget, so measure the production-sized chunk
     # and record both the requested and the measured row count.
@@ -656,9 +777,7 @@ def _e1_one_dense(torch, repo, args, device, T, rows, q_values, q_scale, weights
     k_scales = bundle.k_scales[:T].contiguous()
 
     def fn():
-        return repo.workspace_logits(
-            q, qs, w, k_values, k_scales, ks, ke, None, 0
-        )
+        return repo.workspace_logits(q, qs, w, k_values, k_scales, ks, ke, None, 0)
 
     dense_ms = _event_bench(torch, fn, args.warmup, args.repeat)
     return {
@@ -684,11 +803,16 @@ def _make_packed_cache(torch, num_pages, page_size, seed, device):
         0, 256, (num_pages, page_size * HALF_D), generator=gen, dtype=torch.uint8
     )
     exp = torch.randint(
-        123, 127, (num_pages, page_size * SCALE_BYTES), generator=gen,
+        123,
+        127,
+        (num_pages, page_size * SCALE_BYTES),
+        generator=gen,
         dtype=torch.uint8,
     )
     flat = torch.cat([payload, exp], dim=1)
-    return flat.reshape(num_pages, page_size, HALF_D + SCALE_BYTES).contiguous().to(device)
+    return (
+        flat.reshape(num_pages, page_size, HALF_D + SCALE_BYTES).contiguous().to(device)
+    )
 
 
 # ===========================================================================
@@ -726,8 +850,9 @@ def _census_tensor(torch, values_fp32_2d, scales_u8_2d, block=MXFP4_BLOCK_SIZE):
     }
 
 
-def _census_chunked(torch, values, scales, decode_fn, block=MXFP4_BLOCK_SIZE,
-                    row_chunk=65536):
+def _census_chunked(
+    torch, values, scales, decode_fn, block=MXFP4_BLOCK_SIZE, row_chunk=65536
+):
     totals = None
     for start in range(0, values.shape[0], row_chunk):
         end = min(start + row_chunk, values.shape[0])
@@ -739,8 +864,14 @@ def _census_chunked(torch, values, scales, decode_fn, block=MXFP4_BLOCK_SIZE,
             totals = part
         else:
             _merge_census(totals, part)
-    return totals if totals is not None else _census_tensor(
-        torch, torch.zeros(0, HEAD_DIM), torch.zeros(0, SCALE_BYTES, dtype=torch.uint8)
+    return (
+        totals
+        if totals is not None
+        else _census_tensor(
+            torch,
+            torch.zeros(0, HEAD_DIM),
+            torch.zeros(0, SCALE_BYTES, dtype=torch.uint8),
+        )
     )
 
 
@@ -749,8 +880,11 @@ def _merge_census(a, b):
     b_n = b["n_elements"]
     n = a_n + b_n
     for key in (
-        "n_elements", "n_nonzero", "n_gt_fp8_max",
-        "n_nonzero_lt_min_subnormal", "n_nonzero_lt_min_normal",
+        "n_elements",
+        "n_nonzero",
+        "n_gt_fp8_max",
+        "n_nonzero_lt_min_subnormal",
+        "n_nonzero_lt_min_normal",
     ):
         a[key] += b[key]
     a["amax"] = max(a["amax"], b["amax"])
@@ -772,7 +906,9 @@ def _merge_census(a, b):
 def run_e2(torch, args, results, bundle, q_bundle):
     k_values, k_scales = bundle.k_values, bundle.k_scales
     census_k = _census_chunked(
-        torch, k_values, k_scales,
+        torch,
+        k_values,
+        k_scales,
         lambda v, s: decode_workspace(torch, v, s),
     )
     census_q = None
@@ -780,7 +916,9 @@ def run_e2(torch, args, results, bundle, q_bundle):
         qv, _, qsb = q_bundle
         # census Q on its 32-element blocks; scales are per head
         census_q = _census_chunked(
-            torch, qv.reshape(-1, HALF_D), qsb.reshape(-1, SCALE_BYTES),
+            torch,
+            qv.reshape(-1, HALF_D),
+            qsb.reshape(-1, SCALE_BYTES),
             lambda v, s: decode_workspace(torch, v, s).reshape(-1, HEAD_DIM),
         )
     return {"k": census_k, "q": census_q}
@@ -799,9 +937,22 @@ def _score_chain(torch, acc, weights):
     return s.sum(dim=1).to(torch.bfloat16).to(torch.float32)
 
 
-def reference_score(torch, q_values, q_scale_bytes, k_values, k_scales, weights,
-                    candidate_blocks, cbs, row_ks, row_ke, *, mode, accum,
-                    col_chunk=2048):
+def reference_score(
+    torch,
+    q_values,
+    q_scale_bytes,
+    k_values,
+    k_scales,
+    weights,
+    candidate_blocks,
+    cbs,
+    row_ks,
+    row_ke,
+    *,
+    mode,
+    accum,
+    col_chunk=2048,
+):
     """Reference-only FP8 (or bf16) compact scoring, pure torch.
 
     ``mode`` is ``"fp8"`` (decode -> clamp -> E4M3) or ``"bf16"`` (decode ->
@@ -835,10 +986,7 @@ def reference_score(torch, q_values, q_scale_bytes, k_values, k_scales, weights,
         kv = k_values[krow_c.reshape(-1)].reshape(rows, c1 - c0, HALF_D)
         ks = k_scales[krow_c.reshape(-1)].reshape(rows, c1 - c0, SCALE_BYTES)
         k = decode_workspace(torch, kv, ks)
-        if mode == "fp8":
-            k = e4m3_roundtrip(torch, k)
-        else:
-            k = k.to(torch.bfloat16).float()
+        k = e4m3_roundtrip(torch, k) if mode == "fp8" else k.to(torch.bfloat16).float()
         acc = torch.einsum("rhd,rcd->rhc", q.to(dtype), k.to(dtype))
         chunk_logits = _score_chain(torch, acc.to(torch.float32), weights)
         chunk_logits = torch.where(valid, chunk_logits, float("-inf"))
@@ -851,7 +999,9 @@ def _error_stats(torch, a, b):
     if not bool(finite.any()):
         return {"n_finite": 0}
     d = (a[finite].float() - b[finite].float()).abs()
-    exact = (a[finite].to(torch.bfloat16) == b[finite].to(torch.bfloat16)).float().mean()
+    exact = (
+        (a[finite].to(torch.bfloat16) == b[finite].to(torch.bfloat16)).float().mean()
+    )
     ref_absmax = float(b[finite].float().abs().max().item())
     max_abs = float(d.max().item())
     return {
@@ -865,12 +1015,14 @@ def _error_stats(torch, a, b):
     }
 
 
-def _topk_overlap(torch, logits_a, logits_b, candidate_blocks, cbs, row_ks, row_ke,
-                  k, topk_impl):
+def _topk_overlap(
+    torch, logits_a, logits_b, candidate_blocks, cbs, row_ks, row_ke, k, topk_impl
+):
     width = logits_a.shape[1]
     k = min(k, width)
-    a = torch.full((logits_a.shape[0], k), -1, dtype=torch.int32,
-                   device=logits_a.device)
+    a = torch.full(
+        (logits_a.shape[0], k), -1, dtype=torch.int32, device=logits_a.device
+    )
     b = torch.full_like(a, -1)
     topk_impl(logits_a, candidate_blocks, cbs, row_ks, row_ke, a)
     topk_impl(logits_b, candidate_blocks, cbs, row_ks, row_ke, b)
@@ -896,7 +1048,7 @@ def run_e3(torch, repo, args, bundle, q_bundle, topk_impl):
     out_rows = []
     for seed in args.seeds:
         for T in args.lengths:
-            if T > args.e3_max_t:
+            if args.e3_max_t < T:
                 continue
             for rows in args.rows:
                 if rows > args.e3_max_rows:
@@ -905,58 +1057,128 @@ def run_e3(torch, repo, args, bundle, q_bundle, topk_impl):
                 k_scales = bundle.k_scales[:T]
                 if q_bundle is None:
                     q_values, q_scale_i32, q_scale_bytes = synth_q(
-                        torch, rows, args.heads, seed=seed, q_std=args.q_std,
-                        wide=False, wide_factor=args.wide_factor,
-                        wide_stride=args.wide_stride, device=device,
+                        torch,
+                        rows,
+                        args.heads,
+                        seed=seed,
+                        q_std=args.q_std,
+                        wide=False,
+                        wide_factor=args.wide_factor,
+                        wide_stride=args.wide_stride,
+                        device=device,
                     )
                 else:
                     q_values, q_scale_bytes = q_bundle[0][:rows], q_bundle[2][:rows]
-                    q_scale_i32 = q_scale_bytes.view(torch.int32).reshape(
-                        rows, args.heads
-                    ).contiguous()
+                    q_scale_i32 = (
+                        q_scale_bytes.view(torch.int32)
+                        .reshape(rows, args.heads)
+                        .contiguous()
+                    )
                 weights = torch.randn(
-                    rows, args.heads, dtype=torch.bfloat16,
+                    rows,
+                    args.heads,
+                    dtype=torch.bfloat16,
                     generator=torch.Generator().manual_seed(seed + 7),
                 ).to(device)
                 ks, ke = make_row_bounds(torch, rows, T, device)
                 cand = make_candidate_blocks(torch, rows, T, args, device)
-                entry = {"seed": seed, "T": T, "rows": rows, "width": width,
-                         "kernel_available": repo is not None}
+                entry = {
+                    "seed": seed,
+                    "T": T,
+                    "rows": rows,
+                    "width": width,
+                    "kernel_available": repo is not None,
+                }
                 try:
                     if repo is not None:
                         bf16_logits = repo.prefill_chunk(
-                            q_values, q_scale_i32, k_values, k_scales, weights,
-                            ks, ke, cand, cbs,
+                            q_values,
+                            q_scale_i32,
+                            k_values,
+                            k_scales,
+                            weights,
+                            ks,
+                            ke,
+                            cand,
+                            cbs,
                         )
                         bf16_src = "triton_kernel"
                     else:
                         bf16_logits = reference_score(
-                            torch, q_values, q_scale_bytes, k_values, k_scales,
-                            weights, cand, cbs, ks, ke, mode="bf16", accum="fp32",
+                            torch,
+                            q_values,
+                            q_scale_bytes,
+                            k_values,
+                            k_scales,
+                            weights,
+                            cand,
+                            cbs,
+                            ks,
+                            ke,
+                            mode="bf16",
+                            accum="fp32",
                             col_chunk=args.e3_col_chunk,
                         )
                         bf16_src = "torch_reference"
                     fp8_fp32 = reference_score(
-                        torch, q_values, q_scale_bytes, k_values, k_scales,
-                        weights, cand, cbs, ks, ke, mode="fp8", accum="fp32",
+                        torch,
+                        q_values,
+                        q_scale_bytes,
+                        k_values,
+                        k_scales,
+                        weights,
+                        cand,
+                        cbs,
+                        ks,
+                        ke,
+                        mode="fp8",
+                        accum="fp32",
                         col_chunk=args.e3_col_chunk,
                     )
                     fp8_fp64 = reference_score(
-                        torch, q_values, q_scale_bytes, k_values, k_scales,
-                        weights, cand, cbs, ks, ke, mode="fp8", accum="fp64",
+                        torch,
+                        q_values,
+                        q_scale_bytes,
+                        k_values,
+                        k_scales,
+                        weights,
+                        cand,
+                        cbs,
+                        ks,
+                        ke,
+                        mode="fp8",
+                        accum="fp64",
                         col_chunk=args.e3_col_chunk,
                     )
                     entry["bf16_source"] = bf16_src
-                    entry["fp8_fp32_vs_bf16"] = _error_stats(torch, fp8_fp32, bf16_logits)
-                    entry["fp8_fp64_vs_bf16"] = _error_stats(torch, fp8_fp64, bf16_logits)
+                    entry["fp8_fp32_vs_bf16"] = _error_stats(
+                        torch, fp8_fp32, bf16_logits
+                    )
+                    entry["fp8_fp64_vs_bf16"] = _error_stats(
+                        torch, fp8_fp64, bf16_logits
+                    )
                     entry["fp8_fp32_vs_fp64"] = _error_stats(torch, fp8_fp32, fp8_fp64)
                     entry["topk_overlap_fp8_fp32"] = _topk_overlap(
-                        torch, bf16_logits, fp8_fp32, cand, cbs, ks, ke,
-                        args.index_topk, topk_impl,
+                        torch,
+                        bf16_logits,
+                        fp8_fp32,
+                        cand,
+                        cbs,
+                        ks,
+                        ke,
+                        args.index_topk,
+                        topk_impl,
                     )
                     entry["topk_overlap_fp8_fp64"] = _topk_overlap(
-                        torch, bf16_logits, fp8_fp64, cand, cbs, ks, ke,
-                        args.index_topk, topk_impl,
+                        torch,
+                        bf16_logits,
+                        fp8_fp64,
+                        cand,
+                        cbs,
+                        ks,
+                        ke,
+                        args.index_topk,
+                        topk_impl,
                     )
                 except Exception as exc:  # noqa: BLE001
                     entry["error"] = f"{type(exc).__name__}: {exc}"
@@ -1003,8 +1225,13 @@ def load_repo(args):
         _gather_prefill_chunk_k,
     )
 
-    def make_chunk(max_local_total_seq_lens, skip_kv_gather, local_total_seq_lens,
-                   block_table, local_cu_seq_lens):
+    def make_chunk(
+        max_local_total_seq_lens,
+        skip_kv_gather,
+        local_total_seq_lens,
+        block_table,
+        local_cu_seq_lens,
+    ):
         return SimpleNamespace(
             max_local_total_seq_lens=max_local_total_seq_lens,
             skip_kv_gather=skip_kv_gather,
@@ -1039,7 +1266,9 @@ def load_workspace_pt(torch, path, args, device):
         qs = data["q_scale"].to(device)
         q_bytes = qs.view(torch.uint8).reshape(qv.shape[0], qv.shape[1], SCALE_BYTES)
         q_bundle = (qv, qs, q_bytes.contiguous())
-    return SyntheticBundle(k_values=k_values, k_scales=k_scales, T=T, tag="dump"), q_bundle
+    return SyntheticBundle(
+        k_values=k_values, k_scales=k_scales, T=T, tag="dump"
+    ), q_bundle
 
 
 # ===========================================================================
@@ -1059,27 +1288,36 @@ def print_human_summary(results):
     print("=" * 100)
     cfg = results["config"]
     print(
-        f"device={results.get('device')} heads={cfg['heads']} cbs={cfg['candidate_block_size']} "
-        f"candidate_topk_blocks={cfg['candidate_topk_blocks']} index_topk={cfg['index_topk']} "
-        f"min_split_seq_len={cfg['min_split_seq_len']} max_logits_mb={cfg['max_logits_mb']}"
+        f"device={results.get('device')} heads={cfg['heads']} "
+        f"cbs={cfg['candidate_block_size']} "
+        f"candidate_topk_blocks={cfg['candidate_topk_blocks']} "
+        f"index_topk={cfg['index_topk']} "
+        f"min_split_seq_len={cfg['min_split_seq_len']} "
+        f"max_logits_mb={cfg['max_logits_mb']}"
     )
     if results.get("dry_run"):
         print("DRY RUN: shapes planned, no torch/CUDA touched.")
-        print(f"{'T':>8} {'rows':>6} {'raw~tok':>10} {'rows/chunk':>11} {'chunks':>7} "
-              f"{'compact_w':>10} {'dense_ok':>9}")
+        print(
+            f"{'T':>8} {'rows':>6} {'raw~tok':>10} {'rows/chunk':>11} {'chunks':>7} "
+            f"{'compact_w':>10} {'dense_ok':>9}"
+        )
         for row in results["plan"]:
             print(
                 f"{row['T']:>8} {row['rows']:>6} {row['raw_tokens_equivalent']:>10} "
-                f"{row['chunker']['rows_per_chunk']:>11} {row['chunker']['num_chunks']:>7} "
-                f"{row['compact_width']:>10} {str(row['chunker']['logits_constraint_ok']):>9}"
+                f"{row['chunker']['rows_per_chunk']:>11} "
+                f"{row['chunker']['num_chunks']:>7} "
+                f"{row['compact_width']:>10} "
+                f"{str(row['chunker']['logits_constraint_ok']):>9}"
             )
         return
 
     e1 = results.get("e1", [])
     if e1:
         print("\nE1 - timing split (median ms; gather / logits / topk / total)")
-        print(f"{'seed':>4} {'T':>8} {'rows':>6} {'gather':>9} {'logits':>9} "
-              f"{'topk':>9} {'total':>9} {'logit%':>7} {'dense_ms':>9} {'dense_r':>7}")
+        print(
+            f"{'seed':>4} {'T':>8} {'rows':>6} {'gather':>9} {'logits':>9} "
+            f"{'topk':>9} {'total':>9} {'logit%':>7} {'dense_ms':>9} {'dense_r':>7}"
+        )
         for row in e1:
             c = row.get("compact", {})
             d = row.get("dense", {})
@@ -1089,7 +1327,7 @@ def print_human_summary(results):
                 f"{row['seed']:>4} {row['T']:>8} {row['rows']:>6} "
                 f"{_shape_str(c.get('gather_ms')):>9} {_shape_str(lg):>9} "
                 f"{_shape_str(c.get('topk_ms')):>9} {_shape_str(tot):>9} "
-                f"{(c.get('logits_fraction_of_total') or 0)*100:>6.1f}% "
+                f"{(c.get('logits_fraction_of_total') or 0) * 100:>6.1f}% "
                 f"{_shape_str(d.get('logits_ms')):>9} {d.get('rows_measured', '-'):>7}"
             )
 
@@ -1104,9 +1342,9 @@ def print_human_summary(results):
                 continue
             print(
                 f"  {name}: amax={c['amax']:.4g}  >448={c['n_gt_fp8_max']} "
-                f"({c['frac_gt_fp8_max']*100:.4f}%)  "
+                f"({c['frac_gt_fp8_max'] * 100:.4f}%)  "
                 f"flush<2^-9={c['n_nonzero_lt_min_subnormal']} "
-                f"({c['frac_nonzero_lt_min_subnormal']*100:.4f}% of nonzeros)  "
+                f"({c['frac_nonzero_lt_min_subnormal'] * 100:.4f}% of nonzeros)  "
                 f"block_amax(max/mean)={c['block_amax_max']:.4g}/{c['block_amax_mean']:.4g}"
             )
 
@@ -1115,8 +1353,10 @@ def print_human_summary(results):
         if not e3:
             continue
         print(f"\nE3 - numeric + top-k equivalence ({tag})")
-        print(f"{'T':>8} {'rows':>6} {'bf16_src':>15} {'maxerr':>10} {'meanerr':>10} "
-              f"{'bf16match':>10} {'topk_ovl':>9}")
+        print(
+            f"{'T':>8} {'rows':>6} {'bf16_src':>15} {'maxerr':>10} {'meanerr':>10} "
+            f"{'bf16match':>10} {'topk_ovl':>9}"
+        )
         for row in e3:
             st = row.get("fp8_fp32_vs_bf16", {})
             ov = row.get("topk_overlap_fp8_fp32", {})
@@ -1197,7 +1437,9 @@ def _git_commit(args):
             os.path.join(os.path.dirname(__file__), "..", "..", "..")
         )
         return subprocess.check_output(
-            ["git", "-C", root, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:  # noqa: BLE001
         return None
@@ -1207,23 +1449,35 @@ def _plan_rows(args):
     rows = []
     for T in args.lengths:
         for r in args.rows:
-            rows.append({
-                "T": T,
-                "rows": r,
-                "raw_tokens_equivalent": T * args.compress_ratio,
-                "compact_width": args.candidate_topk_blocks * args.candidate_block_size,
-                "chunker": chunk_plan(args, T, r),
-            })
+            rows.append(
+                {
+                    "T": T,
+                    "rows": r,
+                    "raw_tokens_equivalent": T * args.compress_ratio,
+                    "compact_width": args.candidate_topk_blocks
+                    * args.candidate_block_size,
+                    "chunker": chunk_plan(args, T, r),
+                }
+            )
     return rows
 
 
 def do_dry_run(args):
     results = _base_results(args)
-    results.update({"dry_run": True, "cpu_selftest": False, "device": "none",
-                    "plan": _plan_rows(args), "e1": [], "e2": {}, "e3": {},
-                    "unverified": [
-                        "GPU measurements are unrun: this is --dry-run.",
-                    ]})
+    results.update(
+        {
+            "dry_run": True,
+            "cpu_selftest": False,
+            "device": "none",
+            "plan": _plan_rows(args),
+            "e1": [],
+            "e2": {},
+            "e3": {},
+            "unverified": [
+                "GPU measurements are unrun: this is --dry-run.",
+            ],
+        }
+    )
     print_human_summary(results)
     emit(results, args.out)
     return 0
@@ -1241,23 +1495,50 @@ def do_cpu_selftest(args):
     tiny_rows = min(args.rows) if args.rows else 4
     tiny_rows = min(tiny_rows, 8)
     results = _base_results(args)
-    results.update({"dry_run": False, "cpu_selftest": True, "device": "cpu",
-                    "e1": [], "e3": {}})
+    results.update(
+        {"dry_run": False, "cpu_selftest": True, "device": "cpu", "e1": [], "e3": {}}
+    )
     bundle = synth_k_workspace(
-        torch, tiny_T, seed=0, k_std=args.k_std, wide=False,
-        wide_factor=1.0, wide_stride=args.wide_stride, device=device,
+        torch,
+        tiny_T,
+        seed=0,
+        k_std=args.k_std,
+        wide=False,
+        wide_factor=1.0,
+        wide_stride=args.wide_stride,
+        device=device,
     )
     wide = synth_k_workspace(
-        torch, tiny_T, seed=0, k_std=args.k_std, wide=True,
-        wide_factor=args.wide_factor, wide_stride=args.wide_stride, device=device,
+        torch,
+        tiny_T,
+        seed=0,
+        k_std=args.k_std,
+        wide=True,
+        wide_factor=args.wide_factor,
+        wide_stride=args.wide_stride,
+        device=device,
     )
     q = synth_q(
-        torch, tiny_rows, args.heads, seed=0, q_std=args.q_std, wide=False,
-        wide_factor=1.0, wide_stride=args.wide_stride, device=device,
+        torch,
+        tiny_rows,
+        args.heads,
+        seed=0,
+        q_std=args.q_std,
+        wide=False,
+        wide_factor=1.0,
+        wide_stride=args.wide_stride,
+        device=device,
     )
     q_wide = synth_q(
-        torch, tiny_rows, args.heads, seed=0, q_std=args.q_std, wide=True,
-        wide_factor=args.wide_factor, wide_stride=args.wide_stride, device=device,
+        torch,
+        tiny_rows,
+        args.heads,
+        seed=0,
+        q_std=args.q_std,
+        wide=True,
+        wide_factor=args.wide_factor,
+        wide_stride=args.wide_stride,
+        device=device,
     )
     results["e2"] = {
         "realistic": run_e2(torch, args, results, bundle, q),
@@ -1273,36 +1554,83 @@ def do_cpu_selftest(args):
                 k_scales = bundle_.k_scales[:T]
                 qv, q_i32, q_bytes = qb
                 weights = torch.randn(
-                    rows, args.heads, dtype=torch.bfloat16,
+                    rows,
+                    args.heads,
+                    dtype=torch.bfloat16,
                     generator=torch.Generator().manual_seed(7),
                 )
                 ks, ke = make_row_bounds(torch, rows, T, device)
                 cand = make_candidate_blocks(torch, rows, T, args, device)
                 bf16_logits = reference_score(
-                    torch, qv, q_bytes, k_values, k_scales, weights, cand, cbs,
-                    ks, ke, mode="bf16", accum="fp32", col_chunk=args.e3_col_chunk,
+                    torch,
+                    qv,
+                    q_bytes,
+                    k_values,
+                    k_scales,
+                    weights,
+                    cand,
+                    cbs,
+                    ks,
+                    ke,
+                    mode="bf16",
+                    accum="fp32",
+                    col_chunk=args.e3_col_chunk,
                 )
                 fp8_fp32 = reference_score(
-                    torch, qv, q_bytes, k_values, k_scales, weights, cand, cbs,
-                    ks, ke, mode="fp8", accum="fp32", col_chunk=args.e3_col_chunk,
+                    torch,
+                    qv,
+                    q_bytes,
+                    k_values,
+                    k_scales,
+                    weights,
+                    cand,
+                    cbs,
+                    ks,
+                    ke,
+                    mode="fp8",
+                    accum="fp32",
+                    col_chunk=args.e3_col_chunk,
                 )
                 fp8_fp64 = reference_score(
-                    torch, qv, q_bytes, k_values, k_scales, weights, cand, cbs,
-                    ks, ke, mode="fp8", accum="fp64", col_chunk=args.e3_col_chunk,
+                    torch,
+                    qv,
+                    q_bytes,
+                    k_values,
+                    k_scales,
+                    weights,
+                    cand,
+                    cbs,
+                    ks,
+                    ke,
+                    mode="fp8",
+                    accum="fp64",
+                    col_chunk=args.e3_col_chunk,
                 )
-                out.append({
-                    "seed": 0, "T": T, "rows": rows, "width": cand.shape[1] * cbs,
-                    "bf16_source": "torch_reference",
-                    "fp8_fp32_vs_bf16": _error_stats(torch, fp8_fp32, bf16_logits),
-                    "fp8_fp64_vs_bf16": _error_stats(torch, fp8_fp64, bf16_logits),
-                    "fp8_fp32_vs_fp64": _error_stats(torch, fp8_fp32, fp8_fp64),
-                    "topk_overlap_fp8_fp32": _topk_overlap(
-                        torch, bf16_logits, fp8_fp32, cand, cbs, ks, ke,
-                        args.index_topk, lambda lg, cb, c, rk, rke, o: _compact_topk(
-                            torch, lg, cb, c, rk, rke, args.index_topk, o
+                out.append(
+                    {
+                        "seed": 0,
+                        "T": T,
+                        "rows": rows,
+                        "width": cand.shape[1] * cbs,
+                        "bf16_source": "torch_reference",
+                        "fp8_fp32_vs_bf16": _error_stats(torch, fp8_fp32, bf16_logits),
+                        "fp8_fp64_vs_bf16": _error_stats(torch, fp8_fp64, bf16_logits),
+                        "fp8_fp32_vs_fp64": _error_stats(torch, fp8_fp32, fp8_fp64),
+                        "topk_overlap_fp8_fp32": _topk_overlap(
+                            torch,
+                            bf16_logits,
+                            fp8_fp32,
+                            cand,
+                            cbs,
+                            ks,
+                            ke,
+                            args.index_topk,
+                            lambda lg, cb, c, rk, rke, o: _compact_topk(
+                                torch, lg, cb, c, rk, rke, args.index_topk, o
+                            ),
                         ),
-                    ),
-                })
+                    }
+                )
         return out
 
     results["e3"] = {
@@ -1320,28 +1648,39 @@ def do_cpu_selftest(args):
 def do_gpu_run(args):
     torch = _require_torch()
     if not torch.cuda.is_available():
-        print("ERROR: no CUDA device available; use --dry-run or --cpu-selftest.",
-              file=sys.stderr)
+        print(
+            "ERROR: no CUDA device available; use --dry-run or --cpu-selftest.",
+            file=sys.stderr,
+        )
         return 2
     name = torch.cuda.get_device_name(args.device)
     cap = torch.cuda.get_device_capability(args.device)
     repo = load_repo(args)
     results = _base_results(args)
-    results.update({"dry_run": False, "cpu_selftest": False, "device": args.device,
-                    "device_name": name, "compute_capability": list(cap),
-                    "e1": [], "e2": {}, "e3": {}})
+    results.update(
+        {
+            "dry_run": False,
+            "cpu_selftest": False,
+            "device": args.device,
+            "device_name": name,
+            "compute_capability": list(cap),
+            "e1": [],
+            "e2": {},
+            "e3": {},
+        }
+    )
     if cap[0] != 9:
-        print(f"WARNING: {name} is compute capability {cap}, not SM90/Hopper; "
-              "the SM90 fp4 kernel is not validated here.", file=sys.stderr)
-    if not os.environ.get("VLLM_SM90_FP4_INDEXER"):
-        print("WARNING: VLLM_SM90_FP4_INDEXER is not set. The kernels are "
-              "invoked directly, so this does not block the probe, but the "
-              "production layer would not dispatch to them.",
-              file=sys.stderr)
+        print(
+            f"WARNING: {name} is compute capability {cap}, not SM90/Hopper; "
+            "the SM90 fp4 kernel is not validated here.",
+            file=sys.stderr,
+        )
 
     # ---- E2/E3 workspaces -------------------------------------------------
     if args.workspace_pt:
-        bundle, q_bundle = load_workspace_pt(torch, args.workspace_pt, args, args.device)
+        bundle, q_bundle = load_workspace_pt(
+            torch, args.workspace_pt, args, args.device
+        )
         results["workspace_source"] = args.workspace_pt
         wide_bundle = bundle
         q_wide = q_bundle
@@ -1349,23 +1688,46 @@ def do_gpu_run(args):
         T_max = max(args.lengths) if args.lengths else max(args.rows)
         seed = args.seeds[0] if args.seeds else 0
         bundle = synth_k_workspace(
-            torch, T_max, seed=seed, k_std=args.k_std, wide=False,
-            wide_factor=1.0, wide_stride=args.wide_stride, device=args.device,
+            torch,
+            T_max,
+            seed=seed,
+            k_std=args.k_std,
+            wide=False,
+            wide_factor=1.0,
+            wide_stride=args.wide_stride,
+            device=args.device,
         )
         wide_bundle = synth_k_workspace(
-            torch, T_max, seed=seed, k_std=args.k_std, wide=True,
-            wide_factor=args.wide_factor, wide_stride=args.wide_stride,
+            torch,
+            T_max,
+            seed=seed,
+            k_std=args.k_std,
+            wide=True,
+            wide_factor=args.wide_factor,
+            wide_stride=args.wide_stride,
             device=args.device,
         )
         q_bundle = synth_q(
-            torch, min(max(args.rows), args.e3_max_rows), args.heads, seed=seed,
-            q_std=args.q_std, wide=False, wide_factor=1.0,
-            wide_stride=args.wide_stride, device=args.device,
+            torch,
+            min(max(args.rows), args.e3_max_rows),
+            args.heads,
+            seed=seed,
+            q_std=args.q_std,
+            wide=False,
+            wide_factor=1.0,
+            wide_stride=args.wide_stride,
+            device=args.device,
         )
         q_wide = synth_q(
-            torch, min(max(args.rows), args.e3_max_rows), args.heads, seed=seed,
-            q_std=args.q_std, wide=True, wide_factor=args.wide_factor,
-            wide_stride=args.wide_stride, device=args.device,
+            torch,
+            min(max(args.rows), args.e3_max_rows),
+            args.heads,
+            seed=seed,
+            q_std=args.q_std,
+            wide=True,
+            wide_factor=args.wide_factor,
+            wide_stride=args.wide_stride,
+            device=args.device,
         )
         results["workspace_source"] = "synthetic"
 

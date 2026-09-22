@@ -1262,7 +1262,7 @@ class DeepseekV4Indexer(nn.Module):
         ):
             raise ValueError(
                 "attention_config.indexer_sparse_logits on family(90) requires "
-                "VLLM_SM90_FP4_INDEXER=1: the SM90 MXFP4 Triton logits kernels "
+                "CUDA support for the SM90 MXFP4 Triton logits kernels, which "
                 "replace the SM100-only DeepGEMM sparse path."
             )
         use_sparse_logits = (

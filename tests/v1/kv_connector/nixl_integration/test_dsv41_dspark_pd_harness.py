@@ -61,11 +61,6 @@ def harness_config(**env_overrides: str) -> dict[str, str]:
         "MAX_NUM_BATCHED_TOKENS",
         "PREFILL_SPEC_CONFIG",
         "DECODE_SPEC_CONFIG",
-        "VLLM_SM90_FP4_INDEXER",
-        "VLLM_SM90_FP8_BLOCK32_STATIC",
-        "VLLM_SM90_MHC_SPLIT_H",
-        "VLLM_SM90_FP4_GROUP6",
-        "VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES",
     ):
         env.pop(leaked, None)
     env.update(env_overrides)
@@ -579,28 +574,6 @@ def test_speculative_decoding_can_be_turned_off_by_omitting_the_flag():
         "method": "dspark",
         "num_speculative_tokens": 3,
     }
-
-
-def test_opt_in_sm90_flags_are_explicit_in_the_service_environment():
-    """An A/B that cannot show which value the worker saw is not an A/B.
-
-    These two keep the library default (off) but are exported anyway, so the
-    value is decided by this harness rather than by an ambient shell that may
-    not reach the container at all.
-    """
-    cfg = harness_config()
-    assert cfg["VLLM_SM90_FP4_GROUP6"] == "0"
-    assert cfg["VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"] == "0"
-    # The always-on three keep their ported-path default.
-    assert cfg["VLLM_SM90_FP4_INDEXER"] == "1"
-    assert cfg["VLLM_SM90_FP8_BLOCK32_STATIC"] == "1"
-    assert cfg["VLLM_SM90_MHC_SPLIT_H"] == "1"
-
-    cfg = harness_config(
-        VLLM_SM90_FP4_GROUP6="1", VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES="1"
-    )
-    assert cfg["VLLM_SM90_FP4_GROUP6"] == "1"
-    assert cfg["VLLM_SM90_FP4_INDEXER_SKIP_INVALID_TILES"] == "1"
 
 
 def test_router_leg_timeout_is_stated_not_implicit():

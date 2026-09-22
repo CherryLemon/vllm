@@ -26,7 +26,7 @@ kernel.  The meaningful, tight, non-vacuous statement is
     |out - exact| <= rtol * sum(|a*b|)          (rtol ~ 5e-4, measured 1.2e-4)
 
 i.e. relative to the magnitude actually accumulated, which is the natural error
-scale of the MMA.  A kernel that mis-indexed a scale, a K block or a tile would
+scale of the MMA. A kernel that indexed a scale, K block or tile incorrectly would
 exceed this by orders of magnitude.
 
 The bf16 output is checked separately and much more tightly: because only the
@@ -160,7 +160,9 @@ def _assert_bf16_matches_exact(
     )
 
 
-def _assert_bf16_is_rounded_fp32(out_bf16: torch.Tensor, out_fp32: torch.Tensor) -> None:
+def _assert_bf16_is_rounded_fp32(
+    out_bf16: torch.Tensor, out_fp32: torch.Tensor
+) -> None:
     """bf16 output == fp32 output rounded to bf16 (<=1 ulp on boundary elements)."""
     expected = out_fp32.to(torch.bfloat16)
     neq = out_bf16 != expected
@@ -284,14 +286,17 @@ def test_matches_torch_reference_nonnegative(N: int, K: int, M: int):
 
 
 @requires_sm90
-@pytest.mark.parametrize("N,K,M", [
-    (1280, 5120, 1),    # SWAP_AB, SPLIT_K=8
-    (1280, 5120, 7),    # SWAP_AB, SPLIT_K=8
-    (1280, 5120, 96),   # SWAP_AB, SPLIT_K=8
-    (2304, 5120, 97),   # generic, SWAP_AB=False, SPLIT_K=1
-    (512, 48, 33),      # K masking (K % 32 != 0)
-    (5120, 15360, 97),  # SWAP_AB=False, SPLIT_K=1, large K
-])
+@pytest.mark.parametrize(
+    "N,K,M",
+    [
+        (1280, 5120, 1),  # SWAP_AB, SPLIT_K=8
+        (1280, 5120, 7),  # SWAP_AB, SPLIT_K=8
+        (1280, 5120, 96),  # SWAP_AB, SPLIT_K=8
+        (2304, 5120, 97),  # generic, SWAP_AB=False, SPLIT_K=1
+        (512, 48, 33),  # K masking (K % 32 != 0)
+        (5120, 15360, 97),  # SWAP_AB=False, SPLIT_K=1, large K
+    ],
+)
 def test_single_k_block_indexing_is_bit_exact(N: int, K: int, M: int):
     """Exactly one K block is non-zero and all operand values are powers of two.
 
@@ -399,8 +404,6 @@ def test_k_masking_path():
 # ---------------------------------------------------------------------------
 # Linear / BMM class wiring
 # ---------------------------------------------------------------------------
-def _enable(monkeypatch):
-    monkeypatch.setenv("VLLM_SM90_FP8_BLOCK32_STATIC", "1")
 
 
 def _param(t: torch.Tensor) -> Parameter:
@@ -410,7 +413,6 @@ def _param(t: torch.Tensor) -> Parameter:
 
 @requires_sm90
 def test_linear_kernel_apply_weights(monkeypatch):
-    _enable(monkeypatch)
     N, K, M = 1280, 5120, 97
     layer = types.SimpleNamespace(
         weight=_param(_rand_fp8((N, K))),
@@ -441,7 +443,6 @@ def test_linear_kernel_apply_weights(monkeypatch):
 @requires_sm90
 @pytest.mark.parametrize("group", [1, 2])
 def test_bmm_kernel_apply_weights(monkeypatch, group: int):
-    _enable(monkeypatch)
     N, K, T = 1024, 4096, 33
     total_n = group * N
     layer = types.SimpleNamespace(
@@ -478,36 +479,25 @@ def test_bmm_kernel_apply_weights(monkeypatch, group: int):
         )
         _assert_bf16_is_rounded_fp32(out[:, g, :], out32_g)
         _assert_bf16_matches_exact(
-            out[:, g, :], x_q[:, g, :], layer.weight[g], x_s[:, g, :],
+            out[:, g, :],
+            x_q[:, g, :],
+            layer.weight[g],
+            x_s[:, g, :],
             layer.weight_scale[g],
         )
 
 
 # ---------------------------------------------------------------------------
-# Selection is default-off
+# Hardware selection and linear/BMM admission.
 # ---------------------------------------------------------------------------
-def test_cuda_priority_list_keeps_sm90_static_last_by_default(monkeypatch):
-    # Rebuild the list rather than reading the import-time cache, so the test is
-    # valid whether or not the flag happened to be exported when the module was
-    # first imported.
-    monkeypatch.delenv("VLLM_SM90_FP8_BLOCK32_STATIC", raising=False)
+def test_cuda_priority_list_prefers_sm90_static_by_default():
     from vllm.model_executor.kernels.linear import (
-        _cuda_mxfp8_kernels,
         MarlinMxfp8LinearKernel,
+        _cuda_mxfp8_kernels,
     )
 
     cuda = _cuda_mxfp8_kernels()
-    assert cuda[-1] is Sm90StaticMxfp8LinearKernel
-    assert cuda.index(MarlinMxfp8LinearKernel) < cuda.index(
-        Sm90StaticMxfp8LinearKernel
-    )
-    # With the opt-in on it must take precedence over Marlin (SM100 entries
-    # remain ahead of it, which is checked by their own is_supported()).
-    monkeypatch.setenv("VLLM_SM90_FP8_BLOCK32_STATIC", "1")
-    enabled = _cuda_mxfp8_kernels()
-    assert enabled.index(Sm90StaticMxfp8LinearKernel) < enabled.index(
-        MarlinMxfp8LinearKernel
-    )
+    assert cuda.index(Sm90StaticMxfp8LinearKernel) < cuda.index(MarlinMxfp8LinearKernel)
 
 
 def test_backend_map_filters_to_the_sm90_static_kernels():
@@ -518,51 +508,57 @@ def test_backend_map_filters_to_the_sm90_static_kernels():
         _filter_kernels_by_backend,
     )
 
-    assert Sm90StaticMxfp8LinearKernel in _LINEAR_BACKEND_KERNEL_MAP[
-        "mxfp8_sm90_static"
-    ]
+    assert (
+        Sm90StaticMxfp8LinearKernel in _LINEAR_BACKEND_KERNEL_MAP["mxfp8_sm90_static"]
+    )
     possible = [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
     candidates = [*possible, Sm90StaticMxfp8BmmLinearKernel]
     filtered = _filter_kernels_by_backend("mxfp8_sm90_static", candidates)
     assert filtered == [Sm90StaticMxfp8BmmLinearKernel]
 
 
-@requires_sm90
-def test_env_gate_controls_is_supported(monkeypatch):
-    monkeypatch.delenv("VLLM_SM90_FP8_BLOCK32_STATIC", raising=False)
-    assert Sm90StaticMxfp8LinearKernel.is_supported()[0] is False
-    monkeypatch.setenv("VLLM_SM90_FP8_BLOCK32_STATIC", "1")
-    assert Sm90StaticMxfp8LinearKernel.is_supported()[0] is True
-    # bmm_batch_size routes to the BMM class, not the plain linear one.
-    assert Sm90StaticMxfp8LinearKernel.can_implement(
-        Mxfp8LinearLayerConfig(bmm_batch_size=2)
-    )[0] is False
-    assert Sm90StaticMxfp8BmmLinearKernel.can_implement(
-        Mxfp8LinearLayerConfig(bmm_batch_size=2)
-    )[0] is True
-
-
-@requires_sm90
-def test_init_selects_marlin_by_default(monkeypatch):
-    monkeypatch.delenv("VLLM_SM90_FP8_BLOCK32_STATIC", raising=False)
-    from vllm.model_executor.kernels.linear import (
-        _POSSIBLE_MXFP8_KERNELS,
-        MarlinMxfp8LinearKernel,
-        init_mxfp8_linear_kernel,
+@pytest.mark.parametrize(
+    "cuda,family,expected",
+    [(True, 90, True), (True, 100, False), (True, 120, False), (False, 90, False)],
+)
+def test_platform_controls_is_supported(monkeypatch, cuda, family, expected):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda fam: fam == family
+    )
+    assert Sm90StaticMxfp8LinearKernel.is_supported()[0] is expected
+    assert Sm90StaticMxfp8BmmLinearKernel.is_supported()[0] is expected
+    assert (
+        Sm90StaticMxfp8LinearKernel.can_implement(
+            Mxfp8LinearLayerConfig(bmm_batch_size=2)
+        )[0]
+        is False
+    )
+    assert (
+        Sm90StaticMxfp8BmmLinearKernel.can_implement(
+            Mxfp8LinearLayerConfig(bmm_batch_size=2)
+        )[0]
+        is True
     )
 
-    if _POSSIBLE_MXFP8_KERNELS.get(current_platform._enum) is None:
-        pytest.skip("platform enum is not covered by the MXFP8 kernel map")
-    if not MarlinMxfp8LinearKernel.is_supported()[0]:
-        pytest.skip("Marlin is unavailable on this box")
-    assert type(init_mxfp8_linear_kernel()) is MarlinMxfp8LinearKernel
+
+@requires_sm90
+def test_init_selects_sm90_static_by_default():
+    from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+
+    assert type(init_mxfp8_linear_kernel()) is Sm90StaticMxfp8LinearKernel
+
 
 def _triton_variant_count(jit_fn) -> int:
     """Number of compiled Triton variants cached for a @triton.jit function."""
     caches = getattr(jit_fn, "device_caches", None)
     if caches is None:
         pytest.skip("this Triton build does not expose device_caches")
-    return sum(len(entry[0]) for entry in caches.values())
+    assert caches is not None
+    count = 0
+    for entry in caches.values():
+        count += len(entry[0])
+    return count
 
 
 @requires_sm90
@@ -609,13 +605,13 @@ def test_no_per_m_compilation_including_splitk_reduction():
         assert out.shape == (m, N)
 
     run(Ms[0])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     main0 = _triton_variant_count(_w8a8_block_fp8_matmul_hopper_static)
     red0 = _triton_variant_count(_reduce_block_fp8_split_k)
 
     for m in Ms[1:]:
         run(m)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     main1 = _triton_variant_count(_w8a8_block_fp8_matmul_hopper_static)
     red1 = _triton_variant_count(_reduce_block_fp8_split_k)

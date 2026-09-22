@@ -136,9 +136,7 @@ class SparseMQAIndexer(nn.Module):
             # fp32 decode top-k. DeepGEMM's sparse MQA logits and DeepSelect
             # are SM100-only and are deliberately not required here.
             if not current_platform.is_cuda():
-                raise ValueError(
-                    "SparseMQAIndexer SM90 path requires a CUDA platform."
-                )
+                raise ValueError("SparseMQAIndexer SM90 path requires a CUDA platform.")
         elif not (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(100)
@@ -146,7 +144,7 @@ class SparseMQAIndexer(nn.Module):
         ):
             raise ValueError(
                 "SparseMQAIndexer requires an SM100-class GPU and DeepGEMM >= 2.8, "
-                "or family(90) with VLLM_SM90_FP4_INDEXER=1."
+                "or a Hopper (H100/H200) GPU."
             )
         if not self.use_sm90 and not has_deep_select():
             raise ValueError(
@@ -196,21 +194,13 @@ class SparseMQAIndexer(nn.Module):
 
         claims: list[torch.Tensor] = []
         max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        claims.append(
-            torch.empty(max_logits_bytes, dtype=torch.uint8, device=device)
-        )
+        claims.append(torch.empty(max_logits_bytes, dtype=torch.uint8, device=device))
         if self.use_sm90:
-            compact_width = (
-                self.candidate_blocks.shape[1] * self.candidate_block_size
-            )
+            compact_width = self.candidate_blocks.shape[1] * self.candidate_block_size
             scratch_bytes = (
-                _PREFILL_TOPK_ROW_CHUNK
-                * compact_width
-                * _PREFILL_TOPK_BYTES_PER_ELEM
+                _PREFILL_TOPK_ROW_CHUNK * compact_width * _PREFILL_TOPK_BYTES_PER_ELEM
             )
-            claims.append(
-                torch.empty(scratch_bytes, dtype=torch.uint8, device=device)
-            )
+            claims.append(torch.empty(scratch_bytes, dtype=torch.uint8, device=device))
         # Keep the claims alive across the whole call: dropping them earlier
         # would shrink the measured peak back to the largest single one.
         assert len(claims) >= 1

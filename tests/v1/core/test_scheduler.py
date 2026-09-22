@@ -5223,6 +5223,27 @@ def test_fcfs_mixed_skipped_waiting_types_keep_order():
     scheduler._update_waiting_for_remote_kv.assert_called_once_with(req_remote)
 
 
+@pytest.mark.parametrize("status", [RequestStatus.RUNNING, RequestStatus.WAITING])
+def test_duplicate_kv_receive_completion_preserves_active_request(status):
+    """A late worker notification must not free a live request's KV blocks."""
+    request = create_requests(num_requests=1)[0]
+    request.status = status
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.connector = None
+    scheduler.requests = {request.request_id: request}
+    scheduler.finished_recving_kv_req_ids = set()
+    scheduler._free_blocks = Mock()
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_recving={request.request_id})
+    )
+
+    scheduler._free_blocks.assert_not_called()
+    assert scheduler.requests[request.request_id] is request
+    assert request.status == status
+    assert not scheduler.finished_recving_kv_req_ids
+
+
 def test_abort_request_waiting_for_remote_kvs():
     scheduler = create_scheduler(use_kv_connector=True)
 
