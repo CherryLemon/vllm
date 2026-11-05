@@ -9,12 +9,23 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
 import numpy as np
 import torch
 from typing_extensions import deprecated
-
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic64Sym,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
+)
+from vllm.v1.attention.cpu_sequence_proof import (
+    CPUSequenceLengthsProof as CPUSequenceLengthsProof,
+)
+from vllm.v1.attention.cpu_sequence_proof import (
+    PrefillChunkSequenceBounds as PrefillChunkSequenceBounds,
+)
+from vllm.v1.attention.cpu_sequence_proof import (
+    get_current_cpu_seq_lens_proof as get_current_cpu_seq_lens_proof,
+)
+from vllm.v1.attention.cpu_sequence_proof import (
+    set_current_cpu_seq_lens_proof as set_current_cpu_seq_lens_proof,
 )
 
 if TYPE_CHECKING:
@@ -504,6 +515,9 @@ class CommonAttentionMetadata:
     and for all rows outside async spec decode; optimistic for async-spec
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
+
+    cpu_seq_lens_proof: CPUSequenceLengthsProof | None = None
+    """Optional same-step immutable packet evidence; absence means unknown."""
 
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps

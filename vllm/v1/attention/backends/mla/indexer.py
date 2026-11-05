@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 import torch
-
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -29,12 +28,17 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    CPUSequenceLengthsProof,
     MultipleOf,
+    PrefillChunkSequenceBounds,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
+)
+from vllm.v1.attention.cpu_sequence_proof import (
+    validated_prefill_chunk_bound,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -226,6 +230,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
+    cpu_seq_len_bound: PrefillChunkSequenceBounds | None = None
 
 
 _BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS = (
@@ -470,6 +475,7 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    cpu_seq_lens_proof_generation: int | None = None
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -512,6 +518,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    # Backend consumer capability; native FP8/FP4 keeps the schedule.
+    requires_paged_mqa_logits_metadata = True
+    supports_common_decode_lens = False
 
     @classmethod
     def get_cudagraph_support(
@@ -920,16 +929,51 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
+                    metadata.cpu_seq_len_bound = validated_prefill_chunk_bound(
+                        common_attn_metadata,
+                        metadata,
+                        req_slice.start,
+                        req_slice.stop,
+                        num_decodes,
+                        self.decode_threshold,
+                        self.compress_ratio,
+                        self.dcp_world_size,
+                        self.pcp_world_size,
+                    )
                     chunks.append(metadata)
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(chunks)
 
         decode_metadata = None
         if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
-            decode_lens = self.decode_lens_buffer[:num_decodes]
+            decode_lens = None
+            # The INT8 backend can share exact current-step common counts.
+            # Fixed CP/spec/expansion modes and sliced/unbound metadata retain
+            # the native private-buffer path. FULL capture and live execution
+            # must both use the same runner-owned common allocation.
+            if (
+                self.supports_common_decode_lens
+                and not self.use_pcp
+                and self.dcp_world_size == 1
+                and self.vllm_config.speculative_config is None
+                and not self.use_flattening
+                and not self.supports_varlen
+                and self.compress_ratio == 1
+                and type(common_attn_metadata.max_query_len) is int
+                and common_attn_metadata.max_query_len == 1
+                and getattr(common_attn_metadata, "_model_request_id_lease", None)
+                is not None
+            ):
+                provider = getattr(common_attn_metadata, "_model_runtime", None)
+                if provider is not None:
+                    decode_lens = provider.decode_lens_from_common(
+                        common_attn_metadata, num_decodes
+                    )
+            if decode_lens is None:
+                torch.diff(
+                    common_attn_metadata.query_start_loc[: num_decodes + 1],
+                    out=self.decode_lens_buffer[:num_decodes],
+                )
+                decode_lens = self.decode_lens_buffer[:num_decodes]
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -1026,7 +1070,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                self.requires_paged_mqa_logits_metadata
+                and current_platform.is_cuda()
+                and has_deep_gemm()
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,
@@ -1056,6 +1104,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            cpu_seq_lens_proof_generation=(
+                common_attn_metadata.cpu_seq_lens_proof.generation
+                if isinstance(
+                    common_attn_metadata.cpu_seq_lens_proof, CPUSequenceLengthsProof
+                )
+                else None
+            ),
         )
 
         return attn_metadata

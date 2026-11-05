@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 import torch.nn as nn
-
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -261,6 +260,10 @@ class SpecDecodeBaseProposer:
 
         # Determine allowed attention backends once during initialization.
         self.allowed_attn_types: tuple | None = None
+        runtime = getattr(runner, "_model_runtime", None)
+        self._model_draft_graph = (
+            runtime.make_draft_graph(self, runner) if runtime is not None else None
+        )
         if current_platform.is_rocm():
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterMLASparseMetadata,
@@ -432,6 +435,8 @@ class SpecDecodeBaseProposer:
             eagle_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
+        if self._model_draft_graph is not None:
+            self._model_draft_graph.initialize(cudagraph_mode)
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
@@ -523,9 +528,9 @@ class SpecDecodeBaseProposer:
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
-        slot_mappings: dict[str, torch.Tensor]
-        | list[dict[str, torch.Tensor]]
-        | None = None,
+        slot_mappings: (
+            dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+        ) = None,
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
@@ -595,7 +600,27 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            full = getattr(
+                getattr(self, "_model_draft_graph", None), "full_draft3", None
+            )
+            if full is not None:
+                merged = full.try_run(
+                    model_kwargs,
+                    common_attn_metadata,
+                    sampling_metadata,
+                    token_indices_to_sample=token_indices_to_sample,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    group_metadata=per_group_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                )
+                if merged is not None:
+                    return merged
+            ret_hidden_states = self._call_model_with_graph(
+                model_kwargs,
+                common_attn_metadata,
+                draft_index=0,
+                verified_step=num_rejected_tokens_gpu is not None,
+            )
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -687,6 +712,20 @@ class SpecDecodeBaseProposer:
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
+        tail = getattr(getattr(self, "_model_draft_graph", None), "tail", None)
+        if tail is not None:
+            merged = tail.try_run(
+                draft_token_ids,
+                hidden_states,
+                positions,
+                common_attn_metadata,
+                sampling_metadata,
+                batch_size=batch_size,
+                input_batch_size=input_batch_size,
+                verified_step=num_rejected_tokens_gpu is not None,
+            )
+            if merged is not None:
+                return merged
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
@@ -752,7 +791,12 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = self._call_model_with_graph(
+                    model_kwargs,
+                    common_attn_metadata,
+                    draft_index=token_index + 1,
+                    verified_step=True,
+                )
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -1011,6 +1055,15 @@ class SpecDecodeBaseProposer:
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
+
+    def _call_model_with_graph(self, kwargs, common, *, draft_index, verified_step):
+        manager = getattr(self, "_model_draft_graph", None)
+        if manager is None:
+            return self.model(**kwargs)
+        manager.validate_cache_binding()
+        return manager.run(
+            kwargs, common, draft_index=draft_index, verified_step=verified_step
+        )
 
     def model_returns_tuple(self) -> bool:
         if self.method == "mtp":
